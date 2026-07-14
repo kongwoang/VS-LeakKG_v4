@@ -11,8 +11,19 @@ the **Swamidass & Baldi 2007** bit-bound pruning:
 where |A| = popcount of fingerprint A. By sorting ligands by popcount and
 walking the sorted order, for each query Q we only need to compare against
 target T whose popcount |T| satisfies |Q| * threshold <= |T| <= |Q| / threshold.
-For Tanimoto >= 0.85 the eligible popcount window is roughly +/-18% of |Q|,
+For Tanimoto >= 0.80 the eligible popcount window is roughly +/-25% of |Q|,
 collapsing the work by 1-2 orders of magnitude.
+
+THRESHOLD — read before changing it. The KG declares `ligand_similar` to cover
+[0.80, 0.9995). The shipped graph did not: the global pass had actually been run
+at **0.85**, and the only edges below it were 811 legacy `ligand_similar_to_ligand`
+rows emitted by the LIT-PCBA loader alone. So the band [0.80, 0.85) held 427 edges
+where the density of the distribution says it should hold several hundred thousand
+(bin 0.85 alone has 116,990) — and every one of those 427 was a LIT-PCBA pair. The
+primary leakage axis was blind in a whole band, and blind asymmetrically, in the
+band where cross-corpus ligand overlap most needed to be seen. The default is now
+0.80 and it matches the declared contract. Lower it if you want more; never raise
+it without changing the contract in `kg/schema.py` and the docs together.
 
 Within the eligible window we use `rdkit.DataStructs.BulkTanimotoSimilarity`
 which is C-vectorized — ~50M comparisons/second per core.
@@ -28,7 +39,7 @@ CLI:
     PYTHONPATH=src python -m vsleakkg.ligand_similarity \\
         --kg-nodes data/processed/kg_nodes.parquet \\
         --kg-edges data/processed/kg_edges.parquet \\
-        --threshold 0.70 \\
+        --threshold 0.80 \\
         --workers 32
 """
 from __future__ import annotations
@@ -127,7 +138,7 @@ def _init_worker(pc, fp_blobs, lids):
 
 def compute_ligand_similar_edges(
     kg_nodes_path: Path,
-    threshold: float = 0.70,
+    threshold: float = 0.80,
     n_workers: int | None = None,
     chunk_size: int = 200,
 ) -> pl.DataFrame:
@@ -250,7 +261,11 @@ def append_to_kg(edges_path: Path, new_edges: pl.DataFrame) -> int:
     overwrites the previous output instead of accumulating.
     """
     existing = pl.read_parquet(edges_path)
-    drop = {"ligand_similar", "ligand_fingerprint_exact"}
+    # `ligand_similar_to_ligand` is the per-corpus loaders' name for the same
+    # relation. It was NOT in this drop set, so 811 legacy LIT-PCBA rows survived
+    # every re-run and mixed a second, lower threshold into an edge type that is
+    # supposed to have exactly one.
+    drop = {"ligand_similar", "ligand_fingerprint_exact", "ligand_similar_to_ligand"}
     existing = existing.filter(~pl.col("edge_type").is_in(list(drop)))
     merged = pl.concat([existing, new_edges], how="vertical_relaxed").unique()
     merged.write_parquet(edges_path)
@@ -261,7 +276,7 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--kg-nodes", type=Path, required=True)
     p.add_argument("--kg-edges", type=Path, required=True)
-    p.add_argument("--threshold", type=float, default=0.70)
+    p.add_argument("--threshold", type=float, default=0.80)
     p.add_argument("--workers", type=int, default=None)
     p.add_argument("--chunk-size", type=int, default=200)
     p.add_argument("--log-level", default="INFO")

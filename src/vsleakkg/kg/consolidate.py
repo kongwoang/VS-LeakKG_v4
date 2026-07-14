@@ -282,12 +282,35 @@ def _drop_trivial_scaffolds(
     calling it weak evidence of leakage is an interpretation, not a fact, and the KG
     has no business making it. The size is written to `props.n_heavy_atoms` so the
     downstream step can filter on whatever threshold it wants.
+
+    The count itself used to be
+
+        label.str.replace_all(r"[^A-Za-z]", "").str.len_chars()
+
+    which counts LETTERS IN THE SMILES STRING, not atoms. `Cl` and `Br` counted 2;
+    the H in `[nH]` and `[NH2+]` counted as an atom although hydrogen is not a heavy
+    atom at all. Measured against RDKit on a 30,000-scaffold sample: 41.3 % of the
+    values were wrong. This is the fact the removed trivial-scaffold filter was
+    replaced BY — a downstream step filtering on `n_heavy_atoms <= 6` was filtering
+    on a number that does not mean what it says. RDKit is already imported here.
     """
     import json as _j
+    from rdkit import Chem as _Chem
 
     sc = nodes.filter(pl.col("node_type") == NodeType.SCAFFOLD.value)
     if not sc.height:
         return nodes, edges, 0
+
+    def _n_heavy(smi: str) -> int:
+        if not smi:
+            return 0
+        m = _Chem.MolFromSmiles(smi)
+        if m is None:
+            # A handful of RDKit Murcko artefacts (aromatic carbanions like [c-])
+            # do not round-trip. Record -1 rather than a plausible-looking lie:
+            # a downstream filter can see "unknown" but cannot see a wrong number.
+            return -1
+        return m.GetNumHeavyAtoms()
 
     def _with_size(row: dict) -> str:
         try:
@@ -298,7 +321,7 @@ def _drop_trivial_scaffolds(
         return _j.dumps(d, sort_keys=True)
 
     ann = (sc.with_columns(
-               pl.col("label").str.replace_all(r"[^A-Za-z]", "").str.len_chars().alias("_n"))
+               pl.col("label").map_elements(_n_heavy, return_dtype=pl.Int64).alias("_n"))
              .with_columns(
                  pl.struct(["props", "_n"])
                    .map_elements(_with_size, return_dtype=pl.Utf8).alias("_props"))
@@ -415,6 +438,58 @@ def _add_protein_cluster_edges(
     if new_edge_dfs:
         edges = pl.concat([edges] + new_edge_dfs, how="vertical_relaxed")
     return nodes, edges
+
+
+def _add_protein_exact_edges(
+    nodes: pl.DataFrame,
+    edges: pl.DataFrame,
+    processed: Path,
+    stats: BuildStats,
+) -> pl.DataFrame:
+    """Protein <-> Protein: same protein by sequence.
+
+    `protein_exact` is declared in the schema, carries weight 1.00, and is listed in
+    AXIS_EDGE_TYPES["protein"] — and the graph shipped with ZERO edges of it. So two
+    Protein nodes holding the same protein under different accessions were never
+    joined, and the strongest cross-corpus protein leak there is scored 0.85 x 0.85
+    = 0.72 (the detour through the 90 % cluster) instead of 1.00. It also means the
+    headline "142 proteins shared by >= 2 corpora" is an undercount: DUD-E and DEKOIS
+    overlap on FGFR1, FKBP1A and JNK3, and the graph could not say so.
+
+    The rule is structural, and deliberately says nothing about species: >= 98 %
+    identity over >= 90 % of BOTH sequences (see tools/build_protein_axis.py). The
+    both-sides coverage requirement is what preserves the HIV domain split — the
+    99-aa protease is 100 % identical to a SLICE of the 1,447-aa polyprotein, but
+    covers only 7 % of it.
+
+    `props.pident` carries the identity, so a downstream step can raise the floor.
+    The KG records the fact; the threshold is policy.
+    """
+    import json as _json
+
+    f = processed / "protein_exact.parquet"
+    if not f.exists():
+        log.warning("protein_exact.parquet missing — the protein axis has no identity "
+                    "relation; run tools/build_protein_axis.py")
+        stats.deferred = (stats.deferred or []) + ["protein_exact_missing"]
+        return edges
+    pe = pl.read_parquet(f)
+    if not pe.height:
+        return edges
+    ids = nodes.filter(pl.col("node_type") == NodeType.PROTEIN.value).select("node_id")
+    new = (pe.select(
+                (pl.lit("protein:") + pl.col("src")).alias("src"),
+                (pl.lit("protein:") + pl.col("dst")).alias("dst"),
+                pl.lit(EdgeType.PROTEIN_EXACT.value).alias("edge_type"),
+                pl.struct(["pident", "alnlen"]).map_elements(
+                    lambda r: _json.dumps({"pident": float(r["pident"]),
+                                           "alnlen": int(r["alnlen"])}, sort_keys=True),
+                    return_dtype=pl.Utf8).alias("props"))
+             .join(ids.rename({"node_id": "src"}), on="src", how="semi")
+             .join(ids.rename({"node_id": "dst"}), on="dst", how="semi"))
+    log.info("protein_exact: %d edges (%d pairs dropped — endpoint not a Protein node)",
+             new.height, pe.height - new.height)
+    return pl.concat([edges, new], how="vertical_relaxed")
 
 
 def _wire_reference_provenance(
@@ -556,26 +631,44 @@ def _wire_reference_provenance(
                                         how="vertical_relaxed")
             n_synth_pub += ex_to_bdb_pub.height
 
-        # bdb_lig -> Protein (UniProt)
+        # bdb_lig -> Protein (UniProt), emitted as Ligand -> Protein directly.
+        #
+        # This used to be emitted as `example_has_protein`, which then had to be
+        # untangled again by `split_example_protein_relation`. Two things went
+        # wrong in that round trip:
+        #
+        #  - The Example -> Protein edge from BindingDB collided with the corpus
+        #    loader's own target edge whenever a ligand had been measured against
+        #    its own target. Dedup on (src, dst) kept ONE of them, and it kept the
+        #    BindingDB row: 305,668 target edges ended up claiming
+        #    props.source = "BindingDB" — a false statement about where the fact
+        #    came from.
+        #  - Those same collisions were then EXCLUDED from ligand_measured_protein
+        #    (the splitter only routes `dst != true_prot` there), so "this ligand
+        #    was measured against this very target" — the strongest evidence of
+        #    pretraining contamination there is — was the one case the graph did
+        #    not record.
+        #
+        # The relation is Ligand -> Protein. Emit it as Ligand -> Protein.
         bdb_prot = (raw_edges.filter(
                 pl.col("edge_type") == "bindingdb_ligand_targets_protein")
             .select([pl.col("src").alias("bdb_lid"),
                      pl.col("dst").alias("prot_id")])
             .unique())
         if bdb_prot.height:
-            ex_to_bdb_prot = (ex_lig
-                              .join(bench_to_bdb, on="bench_lid", how="inner")
-                              .join(bdb_prot, on="bdb_lid", how="inner")
-                              .select([pl.col("example_id").alias("src"),
-                                       pl.col("prot_id").alias("dst")])
-                              .unique())
-            ex_to_bdb_prot = ex_to_bdb_prot.with_columns([
-                pl.lit(EdgeType.EXAMPLE_HAS_PROTEIN.value).alias("edge_type"),
+            lig_to_prot = (ex_lig.select("bench_lid").unique()
+                           .join(bench_to_bdb, on="bench_lid", how="inner")
+                           .join(bdb_prot, on="bdb_lid", how="inner")
+                           .select([pl.col("bench_lid").alias("src"),
+                                    pl.col("prot_id").alias("dst")])
+                           .unique())
+            lig_to_prot = lig_to_prot.with_columns([
+                pl.lit(EdgeType.LIGAND_MEASURED_PROTEIN.value).alias("edge_type"),
                 pl.lit(_json.dumps({"source": "BindingDB"})).alias("props"),
             ])
-            canonical_edges = pl.concat([canonical_edges, ex_to_bdb_prot],
+            canonical_edges = pl.concat([canonical_edges, lig_to_prot],
                                         how="vertical_relaxed")
-            n_synth_prot += ex_to_bdb_prot.height
+            n_synth_prot += lig_to_prot.height
 
         # BindingDB record-as-Assay was attempted but produces a 785K
         # bdb_rec node set of which ~66 % (518K) are orphan after wiring —
@@ -675,6 +768,10 @@ def consolidate(
     nodes, edges = _add_protein_cluster_edges(edges, nodes, processed, stats)
     log.info("after cluster edges: n_nodes=%d, n_edges=%d", nodes.height, edges.height)
 
+    # Protein <-> Protein identity. Declared in the schema at weight 1.00, in the
+    # protein axis, and never once emitted — see _add_protein_exact_edges.
+    edges = _add_protein_exact_edges(nodes, edges, processed, stats)
+
 
     kg_out = Path(output_dir) if output_dir else processed
     nodes, edges, n_stereo = _fixes.merge_stereo_scaffolds(nodes, edges, kg_out)
@@ -739,12 +836,6 @@ def consolidate(
         Path("data/raw/ChEMBL/extracted/chembl_35/chembl_35_sqlite/chembl_35.db"))
     log.info("dropped %d publication edges to placeholder DATASET docs", n_ph)
 
-    # Hub flagging MUST run after wiring: it is a degree cap, and before the wire
-    # step the Assay/Publication nodes have almost no edges — which is why the
-    # 1.73 M-example PubChem placeholder doc was never flagged.
-    nodes, edges, n_hubs = _shard_hub_nodes(nodes, edges, cfg)
-    stats.n_hub_nodes_sharded = n_hubs
-    log.info("annotated node degree (max=%d)", int(nodes["degree"].max()))
     # Universal orphan drop: any node with degree 0 after the dangling-edge
     # prune is removed. This covers Protein/ProteinCluster (cluster member ids
     # that don't match KG protein ids), Assay/Publication (when reference-DB
@@ -816,6 +907,19 @@ def consolidate(
             log.info("deduped %d redundant example_has_protein edges (post protein-id collapse)",
                      deduped_p)
             stats.deferred = (stats.deferred or []) + [f"deduped_example_has_protein={deduped_p}"]
+
+    # Degree LAST — after every edge-removing step above.
+    #
+    # This used to run before the two dedup passes, so the duplicate edges they
+    # remove were still being counted. Measured on the shipped KG: 306,704 nodes
+    # carried a degree higher than their true edge count (305,668 Examples off by
+    # one, 1,036 Proteins off by up to 6,301; 611,336 phantom edges in total).
+    # `degree` is the fact that replaced the `is_hub` policy — it is what the
+    # downstream weight-discount reads. A stale count is not a smaller sin than a
+    # frozen threshold; it is the same sin with a decimal point.
+    nodes, edges, n_hubs = _shard_hub_nodes(nodes, edges, cfg)
+    stats.n_hub_nodes_sharded = n_hubs
+    log.info("annotated node degree (max=%d)", int(nodes["degree"].max()))
 
     # Already eager DataFrames at this point.
     nodes_df = nodes

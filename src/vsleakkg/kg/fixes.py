@@ -419,10 +419,21 @@ def split_example_protein_relation(
                   (pl.lit("tgt:") + pl.col("src").str.split(":").list.get(1)
                    + pl.lit(":") + pl.col("src").str.split(":").list.get(2)).alias("tgt_id"))
                  .join(im, on="tgt_id", how="left"))
-    keep = tagged.filter(pl.col("dst") == pl.col("true_prot")).select(
-        "src", "dst", "edge_type", "props")
-    other = tagged.filter((pl.col("true_prot").is_null())
-                          | (pl.col("dst") != pl.col("true_prot")))
+    # An Example whose target is absent from protein_id_map keeps its target edge.
+    # The previous predicate (`dst == true_prot`) sent those rows to `other`, i.e.
+    # it would silently STRIP the target from every example of any corpus the map
+    # does not cover — turning the corpus loader's own claim into a BindingDB-style
+    # "was measured against" edge. It happens to fire on nothing today only because
+    # the map covers all five corpora; that is luck, not a guarantee.
+    unmapped = tagged.filter(pl.col("true_prot").is_null()).height
+    if unmapped:
+        log.warning("split_example_protein_relation: %d example_has_protein edges "
+                    "have no protein_id_map entry — kept as target edges", unmapped)
+    keep = tagged.filter(
+        pl.col("true_prot").is_null() | (pl.col("dst") == pl.col("true_prot"))
+    ).select("src", "dst", "edge_type", "props")
+    other = tagged.filter(pl.col("true_prot").is_not_null()
+                          & (pl.col("dst") != pl.col("true_prot")))
 
     ex2lig = (edges.filter(pl.col("edge_type") == EdgeType.EXAMPLE_HAS_LIGAND.value)
                    .select(pl.col("src").alias("ex"), pl.col("dst").alias("lig")))
@@ -455,9 +466,19 @@ def validate_canonical(nodes: pl.DataFrame, edges: pl.DataFrame) -> None:
     node_types = {t.value for t in NodeType}
     edge_types = {t.value for t in EdgeType}
 
-    for frame, cols, name in ((nodes, ["node_id", "node_type"], "nodes"),
-                              (edges, ["src", "dst", "edge_type"], "edges")):
+    # Scan EVERY string column, not just the structural ones. The first version
+    # checked node_id/node_type/src/dst/edge_type and stopped — leaving `label`
+    # (which holds the SMILES) and `props` (which holds the 0/1 class label and
+    # the Tanimoto values) unguarded. Those are produced by
+    # `build_graph.make_nodes_edges` via `iter_rows(named=True)` + f-string/json
+    # interpolation, which is the exact pattern build_kg.py documents as the
+    # cause of the null-byte corruption. The net had a hole directly under the
+    # bug it was built to catch.
+    for frame, cols, name in ((nodes, ["node_id", "node_type", "label", "props"], "nodes"),
+                              (edges, ["src", "dst", "edge_type", "props"], "edges")):
         for c in cols:
+            if c not in frame.columns:
+                continue
             bad = frame.filter(pl.col(c).str.contains("\x00")).height
             if bad:
                 sample = frame.filter(pl.col(c).str.contains("\x00"))[c].head(3).to_list()

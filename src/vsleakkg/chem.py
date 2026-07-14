@@ -9,9 +9,11 @@ from typing import Iterable, List, Optional, Sequence
 import numpy as np
 from rdkit import Chem, DataStructs, RDLogger
 from rdkit.Chem import AllChem, SaltRemover
+from rdkit.Chem.MolStandardize import rdMolStandardize
 from rdkit.Chem.Scaffolds import MurckoScaffold
 
 _SALT_REMOVER = SaltRemover.SaltRemover()
+_UNCHARGER = rdMolStandardize.Uncharger()
 
 # RDKit emits warnings for sub-MOL2 parse failures and odd valences. Silence them
 # for batch processing; callers that need to inspect individual molecules can
@@ -185,16 +187,37 @@ def parent_inchikey_batch_parallel(smiles: list[str], n_workers: Optional[int] =
 
 
 def parent_inchikey(smi: str) -> Optional[str]:
-    """Return the InChIKey of the salt-stripped parent molecule.
+    """InChIKey of the parent molecule: salt-stripped, charge-neutralised,
+    stereo-free.
 
-    Removes common counterions (Cl-, Na+, etc. via RDKit's default SaltRemover
-    table) BEFORE computing the InChIKey. Two molecules that share the same
-    parent skeleton but differ only by salt form / protonation will have the
-    same `parent_inchikey` but different full `inchikey`. The KG uses this to
-    bridge them via `same_parent_inchikey_as` edges.
+    This used to strip salts ONLY. That made the function a no-op for the case
+    it existed to catch: RDKit's SaltRemover deletes counterions but does not
+    neutralise a protonated nitrogen, so `C[NH+]1CCN(...)CC1` and
+    `CN1CCN(...)CC1` — the same compound — kept different parent keys and never
+    got bridged. Measured on the shipped KG: `ligand_parent_exact` was a 100 %
+    duplicate of `ligand_exact` (6,939 == 6,939 edges, identical pairs), i.e. it
+    caught exactly zero salt or protonation variants, while 41,238 pairs of
+    Ligand nodes that are the same compound had NO edge between them at all.
 
-    Returns None on parse failure or if salt-stripping leaves an empty
-    fragment.
+    The three normalisations, and why each is here:
+
+    - salt strip      counterions are not part of the compound.
+    - uncharge        protonation state is a property of the buffer, not the
+                      molecule; the corpora disagree because their loaders
+                      sanitised differently (see fixes.one_scaffold_per_ligand,
+                      which documents exactly this drift on N-oxides).
+    - remove stereo   two stereoisomers share a scaffold and a fingerprint, and
+                      a model that memorised one recognises the other. ECFP4
+                      already collapses them (weight 0.95 via
+                      `ligand_fingerprint_exact`), so bridging them here keeps
+                      the identity relation consistent with the fingerprint one
+                      instead of contradicting it.
+
+    Two ligands sharing this key are the same compound modulo salt form,
+    protonation and stereochemistry — a leak of weight 0.95 in Table 2, not the
+    0.65 "similar" they were being scored as (or, for 41,238 pairs, nothing).
+
+    Returns None on parse failure or if stripping leaves an empty fragment.
     """
     mol = _parse(smi)
     if mol is None:
@@ -206,6 +229,8 @@ def parent_inchikey(smi: str) -> Optional[str]:
     if stripped is None or stripped.GetNumAtoms() == 0:
         return None
     try:
+        stripped = _UNCHARGER.uncharge(stripped)
+        Chem.RemoveStereochemistry(stripped)
         return Chem.MolToInchiKey(stripped)
     except Exception:
         return None

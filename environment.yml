@@ -1,14 +1,35 @@
 name: vsleakkg
+
+# PIN THE NATIVE DEPS. The Ligand and Scaffold node ids are
+# `md5(RDKit canonical isomeric SMILES)`, so the graph's identity layer is a
+# function of the RDKit version. This file used to say `- rdkit` with no version
+# (and `python=3.10`, while the environment actually in use is 3.12) — so
+# "the build is deterministic" rested on an unpinned dependency.
+#
+# It is not hypothetical. Re-running the three benchmark loaders under RDKit
+# 2026.03.2, over byte-identical input and identical code, changed ~13,000 node
+# ids relative to the inherited parquets (DUD-E 9,900 · LIT-PCBA 1,885 ·
+# DEKOIS 1,150): RDKit now emits the opposite but equivalent `/` `\` convention
+# for E/Z double bonds, e.g.
+#
+#     input     C(/c1ccncc1)=N\N=C\c2ccncc2
+#     was       C(=N/N=C/c1ccncc1)\c1ccncc1
+#     now       C(=N\N=C\c1ccncc1)/c1ccncc1     # same molecule, different md5
+#
+# A KG whose node ids move when a dependency is upgraded cannot be checksum-
+# verified against a rebuild, which is the one check that catches the
+# intermittent polars corruption. Change these versions only deliberately, and
+# rebuild the whole graph when you do.
 channels:
   - conda-forge
   - bioconda
   - defaults
 dependencies:
-  - python=3.10
-  - rdkit
+  - python=3.12
+  - rdkit=2026.03.2        # determines Ligand/Scaffold node ids — see above
+  - polars=1.40.1
   - openbabel
   - pandas
-  - polars
   - duckdb
   - pyarrow
   - numpy

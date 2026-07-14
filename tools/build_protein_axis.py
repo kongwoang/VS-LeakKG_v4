@@ -313,8 +313,55 @@ for res, tighter in (("90", []), ("50", ["90"]), ("30", ["50", "90"])):
     print(f"  {res}%: {n_before:>5} -> {df['cluster_id'].n_unique():>5} cụm sau khi ép lồng"
           f"   phủ {df['protein_id'].n_unique():,}/{len(seqs):,}")
 
+# ------------------------------------------------------- 4. protein_exact
+# `protein_exact` được schema khai báo (trọng số 1.00) VÀ nằm trong trục protein —
+# và KG chưa bao giờ có một cạnh nào. Hệ quả: hai node Protein mang trình tự đồng
+# nhất 100% (cùng một protein, chỉ khác accession) không hề được nối, nên đường rò
+# rỉ xuyên corpus mạnh nhất bị chấm 0.85 × 0.85 = 0.72 qua cụm 90% thay vì 1.00 —
+# và số "protein dùng chung bởi ≥2 corpus" bị đếm thiếu.
+#
+# Đây KHÔNG phải câu hỏi về loài. Quy tắc thuần cấu trúc: đồng nhất ≥ PIDENT_MIN
+# và alignment phủ ≥ COV_MIN của CẢ HAI trình tự. Phủ hai chiều là mấu chốt — nó
+# giữ nguyên việc tách miền HIV: miền PR (99 aa) đồng nhất 100% với một ĐOẠN của
+# polyprotein P03366 (1.447 aa), nhưng chỉ phủ 7% bên polyprotein nên không gộp.
+#
+# pident được ghi vào props. Ngưỡng là CHÍNH SÁCH: downstream nâng được, KG thì
+# ghi rộng để không đánh mất sự thật.
+PIDENT_MIN = 98.0
+COV_MIN = 0.90
+
+print("\ndựng protein_exact (cùng một protein theo trình tự)")
+pe_tsv = PROC / "_protein_exact_hits.tsv"
+with tempfile.TemporaryDirectory() as td:
+    subprocess.run(
+        ["mmseqs", "easy-search", str(fasta), str(fasta), str(pe_tsv), str(Path(td) / "pe"),
+         "-s", "7.5", "--max-seqs", "300", "-e", "1e-3", "--threads", "16", "-v", "1",
+         "--format-output", "query,target,pident,alnlen,qlen,tlen"],
+        check=True)
+hits = pl.read_csv(pe_tsv, separator="\t", has_header=False,
+                   new_columns=["a", "b", "pident", "alnlen", "qlen", "tlen"])
+pe = (hits.filter(pl.col("a") != pl.col("b"))
+        .filter((pl.col("pident") >= PIDENT_MIN)
+                & ((pl.col("alnlen") / pl.col("qlen")) >= COV_MIN)
+                & ((pl.col("alnlen") / pl.col("tlen")) >= COV_MIN))
+        .with_columns(pl.min_horizontal("a", "b").alias("src"),
+                      pl.max_horizontal("a", "b").alias("dst"))
+        .group_by("src", "dst")
+        .agg(pl.col("pident").max().alias("pident"),
+             pl.col("alnlen").max().alias("alnlen"))
+        .sort(["src", "dst"]))
+pe.write_parquet(PROC / "protein_exact.parquet")
+print(f"  {pe.height} cặp (ident ≥ {PIDENT_MIN}%, phủ ≥ {COV_MIN:.0%} cả hai chiều)")
+
 print("\n=== CỔNG KIỂM TRA ===")
 ok = True
+
+# miền HIV phải KHÔNG bị gộp vào polyprotein — đó là cả lý do chúng được tách
+hiv_bad = pe.filter(
+    (pl.col("src").str.contains("HIV1:") | pl.col("dst").str.contains("HIV1:"))
+    & (pl.col("alnlen") > 700))
+print(f"  miền HIV bị gộp vào polyprotein: {hiv_bad.height} (phải = 0)")
+ok &= hiv_bad.height == 0
 for res in ("30", "50", "90"):
     df = pl.read_parquet(PROC / f"protein_clusters_{res}.parquet")
     miss = len(seqs) - df["protein_id"].n_unique()

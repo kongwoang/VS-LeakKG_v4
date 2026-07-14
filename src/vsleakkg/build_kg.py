@@ -50,7 +50,9 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))
 
 from vsleakkg import chem as vc
+from vsleakkg import build_graph as vb
 from vsleakkg import load_chembl_db, load_bigbind, load_bayesbind
+from vsleakkg import load_dude, load_dekois, load_litpcba_ave
 
 
 # -------- paths --------
@@ -70,6 +72,9 @@ BINDINGDB_TSV = RAW / "BindingDB" / "extracted" / "BindingDB_All.tsv"
 BIGBIND_META  = RAW / "BigBind" / "metadata" / "BigBindV1.5"
 BIGBIND_EXTRACTED = RAW / "BigBind" / "extracted"
 BAYESBIND_ROOT = RAW / "BayesBind" / "extracted"
+DUDE_ROOT      = RAW / "DUD-E"
+DEKOIS_ROOT    = RAW / "DEKOIS" / "extracted"          # contains DEKOIS2/<target>/
+LITPCBA_AVE_ROOT = RAW / "LIT-PCBA" / "splits" / "AVE_unbiased"
 
 for d in (PROCESSED, TABLES, REPORTS, LOGS, TODOS):
     d.mkdir(parents=True, exist_ok=True)
@@ -133,6 +138,96 @@ def run_task(name: str, fn: Callable[[], str]) -> bool:
         append_status(name, "failed", f"{exc}\n\nSee `outputs/reports/todos/{name}.md`.")
         log_disk("task_end_fail", name)
         return False
+
+
+# Edge types whose src is an example_id. An example_id carries its corpus
+# (`ex:LIT-PCBA:VDR:2404447`), so these can NEVER be deduplicated across corpora and
+# their counts must survive the merge EXACTLY. `ligand_has_scaffold` is deliberately
+# absent: its src is a globally-shared Ligand, so a ligand in two corpora legitimately
+# emits the same edge twice and the dedup legitimately removes one.
+EXAMPLE_SCOPED_EDGES = (
+    "example_has_ligand", "example_from_source", "example_targets_protein",
+    "example_in_split", "example_has_label_type", "example_uses_decoy_protocol",
+)
+
+
+def expected_edge_counts() -> dict[str, int]:
+    """Per-edge-type counts summed straight from the per-corpus parquets."""
+    exp: dict[str, int] = {}
+    for _, slug in (("LIT-PCBA-AVE", "litpcba_ave"), ("DUD-E", "dude"),
+                    ("DEKOIS", "dekois"), ("BigBind", "bigbind"),
+                    ("BayesBind", "bayesbind")):
+        f = PROCESSED / f"{slug}_edges.parquet"
+        if not f.exists():
+            continue
+        d = (pl.read_parquet(f, columns=["edge_type"])
+               .group_by("edge_type").agg(pl.len().alias("n")))
+        for et, n in d.iter_rows():
+            exp[et] = exp.get(et, 0) + n
+    return exp
+
+
+def validate_raw_kg(nodes: pl.DataFrame, edges: pl.DataFrame,
+                    expected_examples: int) -> None:
+    """Refuse to write a corrupt RAW KG. Runs at the end of task_build_kg.
+
+    `consolidate` grew a write-time guard after the null-byte incident; `build_kg`,
+    where the corruption actually happens, never did. So a corrupt raw KG was written,
+    and the ~1 h `ligand_similarity` pass then ran on top of it before anything
+    complained. Observed on a bad run (2026-07-14 22:05): 1,128,590 NUL-corrupted
+    `node_type` values, 361,112 corrupted labels, and `example_has_ligand` collapsed
+    from 5,025,493 edges to 48,207 — a KG missing 99 % of its examples, written out
+    without a murmur.
+
+    Two classes of check, because NUL bytes are only the visible symptom:
+      - no NUL byte in any string column;
+      - the row counts that MUST hold by construction (one ligand and one source per
+        Example) actually hold. A silent dedup collapse does not produce NUL bytes.
+
+    A failure means the RUN is bad, not the code. Re-run.
+    """
+    problems: list[str] = []
+    for frame, name in ((nodes, "nodes"), (edges, "edges")):
+        for c, dt in zip(frame.columns, frame.dtypes):
+            if dt != pl.Utf8:
+                continue
+            bad = frame.filter(pl.col(c).str.contains("\x00")).height
+            if bad:
+                problems.append(f"{name}.{c}: {bad:,} value(s) contain NUL bytes")
+
+    # EXACT counts, not "roughly right". A run on 2026-07-14 lost 23,969 LIT-PCBA
+    # `example_has_ligand` edges — no NUL bytes, no duplicate ids, both endpoints
+    # present as nodes, and the minimal repro of concat().unique() over the same
+    # parquets keeps every row. The loss is intermittent and it is SILENT: the only
+    # thing that can catch it is comparing the output against the input, exactly.
+    # A tolerance of 99 % would have waved it through — 5,001,524 / 5,025,493 = 99.52 %
+    # — and 23,969 facts that were never recorded cannot be recovered anywhere.
+    exp = expected_edge_counts()
+    for et in EXAMPLE_SCOPED_EDGES:
+        want = exp.get(et)
+        if not want:
+            continue
+        got = edges.filter(pl.col("edge_type") == et).height
+        if got != want:
+            problems.append(
+                f"{et}: {got:,} edges, the per-corpus parquets hold {want:,} "
+                f"({got - want:+,}). These are example-scoped — they CANNOT dedup "
+                f"across corpora, so any difference is lost data.")
+
+    n_ex = nodes.filter(pl.col("node_type") == "Example").height
+    if n_ex != expected_examples:
+        problems.append(
+            f"Example nodes: {n_ex:,}, expected exactly {expected_examples:,} "
+            f"({n_ex - expected_examples:+,})")
+
+    if problems:
+        raise RuntimeError(
+            "raw KG failed write-time validation — REFUSING to write.\n  "
+            + "\n  ".join(problems)
+            + "\n\nThis is the intermittent polars string-corruption / dedup-collapse "
+              "bug that this box hits under load. The RUN is bad, not the code. "
+              "Re-run build_kg (consider POLARS_MAX_THREADS=8)."
+        )
 
 
 # Ligand node id from canonical SMILES (used everywhere KG-side).
@@ -494,6 +589,107 @@ def task_load_bigbind() -> str:
     return f"examples={examples.height:,} nodes={nodes.height:,} edges={edges.height:,}"
 
 
+# -------- 6c. the three benchmark corpora --------
+# These loaders existed in `src/` but were NOT wired into TASKS. `task_build_kg`
+# reads data/processed/<slug>_{nodes,edges}.parquet and merely log.warning()s
+# when a corpus is missing, so a clean checkout produced a KG with BigBind +
+# BayesBind only — 843,833 of 5,025,493 examples — and reported success. The
+# DUD-E / DEKOIS / LIT-PCBA parquets on disk were inherited artefacts whose
+# generating code was not in this pipeline: 83 % of the graph could not be
+# rebuilt from the repo. Wiring them back is the difference between a KG we can
+# defend and one we merely possess.
+
+
+def _featurize_corpus(df: pl.DataFrame, human: str) -> pl.DataFrame:
+    """Add smiles_canonical / inchikey / scaffold_smiles / parse_ok.
+
+    Rows that fail to parse are KEPT, unlike the BigBind loader which drops
+    them. The inherited DUD-E parquet has 1,434,019 Examples but only 1,434,015
+    example_has_ligand edges: the 4 unparseable rows still became ligand-less
+    Example nodes, and `fixes.drop_ligandless_examples` removes them during
+    consolidation. Dropping them here would shift `_row_idx` and therefore
+    change every example_id downstream of the bad row.
+    """
+    feats = vc.featurize_batch_parallel(df["smiles_input"].to_list(), log=log)
+    out = df.with_columns([
+        pl.Series("smiles_canonical", [f.smiles_canonical for f in feats]),
+        pl.Series("inchikey",         [f.inchikey for f in feats]),
+        pl.Series("scaffold_smiles",  [f.scaffold_smiles for f in feats]),
+        pl.Series("parse_ok",         [f.parse_ok for f in feats]),
+    ])
+    n_bad = int((~out["parse_ok"]).sum())
+    if n_bad:
+        log.warning("%s: %d rows failed RDKit parse — kept as ligand-less Examples",
+                    human, n_bad)
+    return out
+
+
+def _build_corpus(slug: str, human: str, examples_df: pl.DataFrame,
+                  *, include_decoy_protocol: bool) -> str:
+    """Featurize + emit <slug>_{examples,nodes,edges}.parquet."""
+    df = _featurize_corpus(examples_df, human)
+    examples = vb.build_examples_frame(df)
+    nodes, edges = vb.make_nodes_edges(
+        examples,
+        include_decoy_protocol=include_decoy_protocol,
+        include_protein_target=True,
+    )
+    df.write_parquet(PROCESSED / f"{slug}_examples.parquet")
+    nodes.write_parquet(PROCESSED / f"{slug}_nodes.parquet")
+    edges.write_parquet(PROCESSED / f"{slug}_edges.parquet")
+    log.info("%s: %d examples, %d nodes, %d edges",
+             human, df.height, nodes.height, edges.height)
+    return f"examples={df.height:,} nodes={nodes.height:,} edges={edges.height:,}"
+
+
+def _cached(slug: str) -> str | None:
+    ex = PROCESSED / f"{slug}_examples.parquet"
+    n  = PROCESSED / f"{slug}_nodes.parquet"
+    e  = PROCESSED / f"{slug}_edges.parquet"
+    if ex.exists() and n.exists() and e.exists():
+        return (f"cached examples={pl.read_parquet(ex).height:,} "
+                f"nodes={pl.read_parquet(n).height:,} "
+                f"edges={pl.read_parquet(e).height:,}")
+    return None
+
+
+def task_load_dude() -> str:
+    """DUD-E: 102 targets, actives_final.ism + decoys_final.ism per target."""
+    if (c := _cached("dude")):
+        return c
+    if not DUDE_ROOT.exists():
+        raise FileNotFoundError(DUDE_ROOT)
+    # Decoys are generated (property-matched), so the corpus gets a protocol node.
+    return _build_corpus("dude", "DUD-E", load_dude.load_all(DUDE_ROOT),
+                         include_decoy_protocol=True)
+
+
+def task_load_dekois() -> str:
+    """DEKOIS 2.0: one active_decoys.smi per target; BDB* = active, ZINC* = decoy."""
+    if (c := _cached("dekois")):
+        return c
+    if not DEKOIS_ROOT.exists():
+        raise FileNotFoundError(DEKOIS_ROOT)
+    return _build_corpus("dekois", "DEKOIS", load_dekois.load_all(DEKOIS_ROOT),
+                         include_decoy_protocol=True)
+
+
+def task_load_litpcba() -> str:
+    """LIT-PCBA, AVE_unbiased splits: 15 targets, active/inactive x train/validation.
+
+    No decoy-protocol node: LIT-PCBA inactives are *experimentally measured*, not
+    generated. Linking them through a shared protocol would fabricate a leakage
+    path that does not exist (see fixes.DECOY_PROTOCOL).
+    """
+    if (c := _cached("litpcba_ave")):
+        return c
+    if not LITPCBA_AVE_ROOT.exists():
+        raise FileNotFoundError(LITPCBA_AVE_ROOT)
+    return _build_corpus("litpcba_ave", "LIT-PCBA",
+                         load_litpcba_ave.load_all(LITPCBA_AVE_ROOT),
+                         include_decoy_protocol=False)
+
+
 # -------- 7. build_kg --------
 def task_build_kg() -> str:
     """Build the final KG by concatenating per-corpus parquets and adding the
@@ -516,6 +712,7 @@ def task_build_kg() -> str:
     base_n_parts: list = []
     base_e_parts: list = []
     loaded: list = []
+    missing: list[str] = []
     for human, slug in CORPORA:
         n_path = PROCESSED / f"{slug}_nodes.parquet"
         e_path = PROCESSED / f"{slug}_edges.parquet"
@@ -524,11 +721,30 @@ def task_build_kg() -> str:
             base_e_parts.append(pl.read_parquet(e_path))
             loaded.append(human)
         else:
-            log.warning("build_kg: skip %s (per-corpus parquets not present)", human)
-    if not base_n_parts:
-        raise RuntimeError("no per-corpus parquets found; cannot build KG")
-    base_n = pl.concat(base_n_parts, how="vertical_relaxed").unique(subset=["node_id"])
-    base_e = pl.concat(base_e_parts, how="vertical_relaxed").unique()
+            missing.append(human)
+    # A missing corpus used to be a log.warning() — so the build happily produced
+    # a KG covering 17 % of the examples and called itself complete. A KG that is
+    # silently missing four fifths of the corpus is worse than no KG: every
+    # leakage number computed on it is wrong and nothing says so.
+    if missing:
+        raise RuntimeError(
+            f"per-corpus parquets missing for: {', '.join(missing)}. "
+            f"Run the corresponding load_* task first — do NOT build a partial KG.")
+    # rechunk() before unique(): the corruption shows up as string buffers zeroed out
+    # while their offsets survive (node_ids become runs of NUL bytes of exactly the
+    # right length). Concatenating five multi-million-row frames leaves the string
+    # column in many chunks, and it is the multi-chunk path that goes wrong. Forcing a
+    # single contiguous buffer first is not a proof, but it removes the trigger we can
+    # actually see. The write-time guards below are the real protection.
+    base_n = (pl.concat(base_n_parts, how="vertical_relaxed")
+                .rechunk().unique(subset=["node_id"]))
+    base_e = pl.concat(base_e_parts, how="vertical_relaxed").rechunk().unique()
+    for _f, _c, _w in ((base_n, "node_id", "nodes"), (base_e, "edge_type", "edges")):
+        _k = _f.filter(pl.col(_c).str.contains("\x00")).height
+        if _k:
+            raise RuntimeError(
+                f"CORRUPTION at the per-corpus concat: {_k:,} {_w}.{_c} values hold "
+                f"NUL bytes, though every input parquet is clean. Re-run.")
     log.info("KG base after per-corpus dedup: %d nodes %d edges (from %s)",
              base_n.height, base_e.height, "+".join(loaded))
 
@@ -544,6 +760,7 @@ def task_build_kg() -> str:
     # Accumulate (smi, inchikey) across all corpora first, then run parent
     # InChIKey computation in one parallel batch (32× speedup on VUW).
     smi_to_lig: dict = {}
+    smi_to_ik: dict = {}
     ik_to_smis: dict = {}
     parent_to_smis: dict = {}
     all_unique_smis: list[str] = []  # preserve insertion order
@@ -568,6 +785,7 @@ def task_build_kg() -> str:
             smi = smi_list[j]
             ik = ik_list[j]
             smi_to_lig.setdefault(smi, _lig_node_id(smi))
+            smi_to_ik.setdefault(smi, ik)
             ik_to_smis.setdefault(ik, set()).add(smi)
             if smi not in _seen_smi:
                 _seen_smi.add(smi)
@@ -602,18 +820,30 @@ def task_build_kg() -> str:
             cross_src += 1
     log.info("cross-corpus same_inchikey_as edges: %d", cross_src)
 
+    # same_parent_inchikey_as must carry information that same_inchikey_as does not.
+    # It used to be emitted for EVERY parent group, including groups whose members
+    # already share a full InChIKey — so it was a strict superset of same_inchikey_as
+    # by construction, and on the shipped KG it came out an EXACT duplicate of it
+    # (6,939 == 6,939 edges, identical pairs). Skipping the same-full-InChIKey pairs
+    # makes the relation mean what its name says: same compound, DIFFERENT full key
+    # (salt / protonation / stereo variant).
     cross_parent = 0
+    skipped_same_ik = 0
     for pik, smis in parent_to_smis.items():
         if len(smis) <= 1:
             continue
         smis_list = sorted(smis)
-        anchor = smi_to_lig[smis_list[0]]
+        anchor = smis_list[0]
+        anchor_id = smi_to_lig[anchor]
         for s in smis_list[1:]:
-            other = smi_to_lig[s]
-            edges_new.append((anchor, other, "same_parent_inchikey_as",
+            if smi_to_ik.get(s) == smi_to_ik.get(anchor):
+                skipped_same_ik += 1   # already bridged by same_inchikey_as
+                continue
+            edges_new.append((anchor_id, smi_to_lig[s], "same_parent_inchikey_as",
                               json.dumps({"parent_inchikey": pik})))
             cross_parent += 1
-    log.info("cross-corpus same_parent_inchikey_as edges: %d", cross_parent)
+    log.info("cross-corpus same_parent_inchikey_as edges: %d (%d pairs skipped: "
+             "already same full InChIKey)", cross_parent, skipped_same_ik)
 
     # ---- DatasetSource + DatabaseRelease nodes ----
     for src, release in (("ChEMBL35", "ChEMBL_35"),
@@ -841,16 +1071,33 @@ def task_build_kg() -> str:
     # ---- Persist ----
     n_df = pl.DataFrame(nodes_new, schema=["node_id", "node_type", "label", "props"], orient="row")
     e_df = pl.DataFrame(edges_new, schema=["src", "dst", "edge_type", "props"], orient="row")
-    nodes = pl.concat([base_n, n_df], how="vertical_relaxed").unique(subset=["node_id"])
-    # Defensive: keep only node_ids matching our prefixed-ID scheme (contain
-    # a colon). The iter_rows null-byte bug that poisoned ~4M nodes in the
-    # earlier build has been fixed (columns pre-extracted via .to_list()), so
-    # this filter is now a belt-and-suspenders invariant rather than the
-    # primary cleanup. If it ever drops a non-trivial fraction of rows, look
-    # for new iter_rows usage that needs the same treatment.
-    nodes = nodes.filter(pl.col("node_id").str.contains(":"))
-    edges = pl.concat([base_e, e_df], how="vertical_relaxed").unique()
-    edges = edges.filter(pl.col("edge_type").is_not_null() & (pl.col("edge_type") != ""))
+    nodes = pl.concat([base_n, n_df], how="vertical_relaxed").rechunk().unique(subset=["node_id"])
+
+    # This used to be:
+    #     nodes = nodes.filter(pl.col("node_id").str.contains(":"))
+    # described as "belt-and-suspenders", on the belief that "the iter_rows null-byte
+    # bug that poisoned ~4M nodes in the earlier build has been fixed". It is not
+    # fixed. And the filter is not a safety net — it is the thing that HIDES the bug:
+    # it silently deletes every corrupted node, the semi-join below then silently
+    # deletes every edge that touched one, and the build reports success. That is
+    # precisely how a KG with 48,207 `example_has_ligand` edges instead of 5,025,493
+    # got written to disk without a single warning.
+    #
+    # A node_id without ':' is not a node we can drop, it is proof that the frame in
+    # memory is corrupt. Say so, and die.
+    _bad = nodes.filter(~pl.col("node_id").str.contains(":")).height
+    if _bad:
+        raise RuntimeError(
+            f"CORRUPTION: {_bad:,} node_ids have no ':' prefix — the string buffers "
+            f"were zeroed in memory (polars). The RUN is bad, not the code; re-run. "
+            f"Do NOT filter these away: dropping them silently deletes their edges too.")
+
+    edges = pl.concat([base_e, e_df], how="vertical_relaxed").rechunk().unique()
+    _bade = edges.filter(pl.col("edge_type").is_null() | (pl.col("edge_type") == "")).height
+    if _bade:
+        raise RuntimeError(
+            f"CORRUPTION: {_bade:,} edges have an empty edge_type — same bug, same "
+            f"remedy: re-run. Filtering them away would hide it.")
     valid = nodes.select("node_id")
     edges = (edges.join(valid.rename({"node_id": "src"}), on="src", how="semi")
                   .join(valid.rename({"node_id": "dst"}), on="dst", how="semi"))
@@ -879,6 +1126,18 @@ def task_build_kg() -> str:
             f"INVARIANT FAIL: dangling edges src={_dangle_src} dst={_dangle_dst}")
     log.info("build-time invariants passed: 0 dup, 0 null-byte, 0 dangling")
 
+    # The three invariants above all look at `node_id`, and node_id is the ONE string
+    # column the corruption spares. On the bad run of 2026-07-14 they passed cleanly
+    # while `node_type` held 1,128,590 NUL-filled values and `example_has_ligand` had
+    # collapsed from 5,025,493 edges to 48,207. They were blind in exactly the shape
+    # of the bug. This scans every string column, and checks the counts that cannot
+    # legitimately move.
+    n_expected = sum(pl.read_parquet(PROCESSED / f"{slug}_examples.parquet").height
+                     for _, slug in CORPORA
+                     if (PROCESSED / f"{slug}_examples.parquet").exists())
+    validate_raw_kg(nodes, edges, n_expected)
+    log.info("raw-KG write-time validation passed (%d expected Examples)", n_expected)
+
     nodes.write_parquet(PROCESSED / "kg_nodes.parquet")
     edges.write_parquet(PROCESSED / "kg_edges.parquet")
 
@@ -906,6 +1165,12 @@ TASKS = [
     # Per-corpus loaders that produce <corpus>_examples/_nodes/_edges parquets.
     # Must run BEFORE chembl_map/bindingdb_map so their ligands are included
     # in the benchmark <-> reference cross-ref maps.
+    # ALL FIVE corpora belong here. The three benchmark corpora used to be
+    # absent, which let the build succeed on 17 % of the graph — see the comment
+    # above task_load_dude.
+    ("load_dude",         task_load_dude),
+    ("load_dekois",       task_load_dekois),
+    ("load_litpcba",      task_load_litpcba),
     ("load_bigbind",      task_load_bigbind),
     ("load_bayesbind",    task_load_bayesbind),
     # Cross-reference maps + activity provenance (depend on all corpus parquets).

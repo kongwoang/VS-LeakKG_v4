@@ -43,14 +43,24 @@ class EdgeType(str, Enum):
 
     # identity / similarity edges between content nodes
     LIGAND_EXACT = "ligand_exact"               # same full InChIKey, different SMILES
-    LIGAND_PARENT_EXACT = "ligand_parent_exact" # same parent (salt-stripped) InChIKey
+    # Same PARENT InChIKey — salt-stripped, charge-neutralised, stereo-free — and a
+    # DIFFERENT full InChIKey. Both halves of that sentence were false before:
+    # `chem.parent_inchikey` only stripped salts (so a protonated amine never matched
+    # its neutral twin), and `build_kg` emitted the edge for every parent group
+    # including those already sharing a full key. Result: the relation was a 100 %
+    # duplicate of LIGAND_EXACT (6,939 == 6,939 identical pairs) and caught zero of
+    # the variants it exists for, while 41,238 pairs of Ligand nodes that are the same
+    # compound sat in the graph with no edge between them.
+    LIGAND_PARENT_EXACT = "ligand_parent_exact"
     LIGAND_FINGERPRINT_EXACT = "ligand_fingerprint_exact"   # ECFP4 Tanimoto = 1.0, different SMILES (typically stereo)
     LIGAND_SCAFFOLD = "ligand_scaffold"
-    LIGAND_SIMILAR = "ligand_similar"           # ECFP4 Tanimoto in [0.80, 0.9995);
-                                                # >= 0.9995 is LIGAND_FINGERPRINT_EXACT.
-                                                # The 0.80 floor comes from per-corpus
-                                                # loaders that ran at 0.80-0.84; the D5
-                                                # global pass used 0.85.
+    # ECFP4 Tanimoto in [0.80, 0.9995); >= 0.9995 is LIGAND_FINGERPRINT_EXACT.
+    # The 0.80 floor is now real. It used to be a claim: the global pass had been run
+    # at 0.85, and the band [0.80, 0.85) held 427 edges — all of them LIT-PCBA legacy
+    # rows — where the shape of the distribution says it should hold hundreds of
+    # thousands. Changing this floor means changing `ligand_similarity.py` and the
+    # docs in the same commit, and rebuilding.
+    LIGAND_SIMILAR = "ligand_similar"
     PROTEIN_EXACT = "protein_exact"
     # Ligand -> Protein, from BindingDB/ChEMBL: "this ligand has a measured activity
     # against this protein". Deliberately NOT in AXIS_EDGE_TYPES. It used to be

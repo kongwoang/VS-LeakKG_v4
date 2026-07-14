@@ -31,6 +31,7 @@ ENDPOINTS = {
     "ligand_fingerprint_exact": ("Ligand", "Ligand"),
     "ligand_similar":           ("Ligand", "Ligand"),
     "ligand_measured_protein":  ("Ligand", "Protein"),
+    "protein_exact":            ("Protein", "Protein"),
     "protein_cluster_30":       ("Protein", "ProteinCluster"),
     "protein_cluster_50":       ("Protein", "ProteinCluster"),
     "protein_cluster_90":       ("Protein", "ProteinCluster"),
@@ -39,7 +40,7 @@ ENDPOINTS = {
     "decoy_protocol_in_class":  ("DecoyProtocol", "DecoyProtocolClass"),
 }
 PAIR_TYPES = ["ligand_exact", "ligand_parent_exact",
-              "ligand_fingerprint_exact", "ligand_similar"]
+              "ligand_fingerprint_exact", "ligand_similar", "protein_exact"]
 
 _fails: list[str] = []
 
@@ -160,9 +161,154 @@ def semantic(n: pl.LazyFrame, e: pl.LazyFrame) -> None:
           "no method class is shared by two corpora — the axis would just relabel source")
 
 
+LIGAND_SIMILAR_MIN = 0.80
+FINGERPRINT_EXACT_T = 0.9995
+
+
+def facts(n: pl.LazyFrame, e: pl.LazyFrame, *, sample: int) -> None:
+    """Do the values the KG RECORDS agree with the graph it SHIPS?
+
+    The structural and semantic tiers check that the graph is well-formed and that
+    its edges mean what they say. Neither of them ever compared a recorded number
+    against the thing it summarises — so every one of these passed on a KG that had
+    306,704 wrong degrees, 41.3 % wrong heavy-atom counts, a similarity threshold
+    0.05 above its declared contract, and an identity relation that was a verbatim
+    copy of another one. `check("degree" in cols)` is not a check on degree.
+    """
+    print("\n=== FACTS (recorded value vs the data it summarises) ===")
+
+    # 1. degree. The fact that replaced the is_hub policy, and what the downstream
+    #    weight-discount reads. Was computed BEFORE the final dedup passes.
+    deg = (pl.concat([e.select(pl.col("src").alias("node_id")),
+                      e.select(pl.col("dst").alias("node_id"))])
+             .group_by("node_id").agg(pl.len().alias("real")))
+    j = (n.select("node_id", "node_type", "degree")
+          .join(deg, on="node_id", how="left")
+          .with_columns(pl.col("real").fill_null(0))
+          .filter(pl.col("degree") != pl.col("real")).collect())
+    detail = f"{j.height:,} nodes disagree"
+    if j.height:
+        by = dict(j.group_by("node_type").agg(pl.len().alias("k")).iter_rows())
+        detail += f" ({by}); worst delta={int((j['degree'] - j['real']).abs().max())}"
+    check(j.height == 0, "`degree` equals the node's real edge count", detail)
+
+    # 2. An edge type absent from ENDPOINTS is silently exempt from the endpoint
+    #    check — the contract has to be total, or it is not a contract.
+    etypes = set(e.select("edge_type").unique().collect()["edge_type"].to_list())
+    unlisted = sorted(etypes - set(ENDPOINTS))
+    check(not unlisted, "every edge type present has a declared endpoint signature",
+          f"unlisted: {unlisted}")
+
+    # 3. ligand_similar: one threshold, one provenance. The shipped graph mixed a
+    #    0.85 global pass with 427 LIT-PCBA-only rows at 0.80–0.849.
+    ls = (e.filter(pl.col("edge_type") == "ligand_similar")
+           .select(pl.col("props").str.json_path_match("$.tanimoto").cast(pl.Float64).alias("t"),
+                   pl.col("props").str.json_path_match("$.method").alias("m"))
+           .collect())
+    if ls.height:
+        n_null = ls.filter(pl.col("t").is_null()).height
+        check(n_null == 0, "every ligand_similar edge records its Tanimoto", f"{n_null:,} without")
+        lo, hi = ls["t"].min(), ls["t"].max()
+        check(lo is not None and lo >= LIGAND_SIMILAR_MIN and hi < FINGERPRINT_EXACT_T,
+              f"ligand_similar Tanimoto within the declared [{LIGAND_SIMILAR_MIN}, "
+              f"{FINGERPRINT_EXACT_T})", f"observed [{lo}, {hi}]")
+        methods = sorted(set(ls["m"].drop_nulls().to_list()))
+        n_nom = ls.filter(pl.col("m").is_null()).height
+        check(len(methods) <= 1 and n_nom == 0,
+              "ligand_similar comes from ONE pass (one threshold, one method)",
+              f"methods={methods}, {n_nom:,} edges with no method — a second, lower "
+              f"threshold hiding inside the edge type")
+
+    fe = (e.filter(pl.col("edge_type") == "ligand_fingerprint_exact")
+           .select(pl.col("props").str.json_path_match("$.tanimoto").cast(pl.Float64).alias("t"))
+           .collect())
+    if fe.height:
+        below = fe.filter(pl.col("t") < FINGERPRINT_EXACT_T).height
+        check(below == 0, f"ligand_fingerprint_exact Tanimoto >= {FINGERPRINT_EXACT_T}",
+              f"{below:,} below")
+
+    # 4. ligand_parent_exact must say something ligand_exact does not. It used to be
+    #    a byte-identical copy of it (6,939 == 6,939, same pairs).
+    le = e.filter(pl.col("edge_type") == "ligand_exact").select("src", "dst")
+    lp = e.filter(pl.col("edge_type") == "ligand_parent_exact").select("src", "dst")
+    overlap = le.join(lp, on=["src", "dst"], how="semi").select(pl.len()).collect().item()
+    n_lp = lp.select(pl.len()).collect().item()
+    check(overlap == 0,
+          "ligand_parent_exact is disjoint from ligand_exact (different full InChIKey)",
+          f"{overlap:,} of {n_lp:,} parent edges duplicate an exact edge")
+
+    # 5. n_heavy_atoms — the fact the trivial-scaffold FILTER was replaced by. Used to
+    #    count letters in the SMILES string: Cl/Br counted 2, the H in [nH] counted 1.
+    try:
+        from rdkit import Chem, RDLogger
+        RDLogger.DisableLog("rdApp.*")
+        sc = (n.filter(pl.col("node_type") == "Scaffold")
+               .select("label", pl.col("props").str.json_path_match("$.n_heavy_atoms")
+                       .cast(pl.Int64).alias("rec")).collect())
+        s = sc if sc.height <= sample else sc.sample(n=sample, seed=7)
+        wrong = 0
+        for lbl, rec in s.iter_rows():
+            m = Chem.MolFromSmiles(lbl) if lbl else None
+            true = m.GetNumHeavyAtoms() if m is not None else -1
+            if rec != true:
+                wrong += 1
+        check(wrong == 0, "Scaffold props.n_heavy_atoms equals RDKit's heavy-atom count",
+              f"{wrong:,}/{s.height:,} wrong ({100*wrong/max(1, s.height):.1f} %)")
+    except ImportError:
+        print("  [SKIP] n_heavy_atoms — RDKit unavailable")
+
+    # 6. "at most one scaffold" is not the invariant; "exactly one" is. A Ligand with
+    #    no scaffold is invisible to the scaffold axis and nothing said so.
+    lig = n.filter(pl.col("node_type") == "Ligand").select("node_id")
+    has = e.filter(pl.col("edge_type") == "ligand_scaffold").select("src").unique()
+    miss = lig.join(has, left_on="node_id", right_on="src", how="anti").select(pl.len()).collect().item()
+    check(miss == 0, "every Ligand has exactly one scaffold", f"{miss:,} with none")
+
+    # 7. The class label is binary. DEKOIS's loader can emit -1 ("unknown") and every
+    #    downstream tally silently compares only against "1" and "0".
+    y = (n.filter(pl.col("node_type") == "Example")
+          .select(pl.col("props").str.json_path_match("$.label").alias("y"))
+          .group_by("y").agg(pl.len().alias("k")).collect())
+    vals = sorted(y["y"].drop_nulls().to_list())
+    check(vals == ["0", "1"], "Example label is exactly {0, 1}",
+          f"observed {dict(y.iter_rows())}")
+
+    # 8. A target edge is the corpus loader's claim. It used to be deduped against a
+    #    BindingDB-derived edge, and the BindingDB row won: 305,668 target edges
+    #    claimed props.source = "BindingDB", which is simply not where they came from.
+    bad = (e.filter((pl.col("edge_type") == "example_has_protein")
+                    & pl.col("props").str.contains("BindingDB"))
+            .select(pl.len()).collect().item())
+    check(bad == 0, "example_has_protein carries no BindingDB provenance",
+          f"{bad:,} target edges attribute themselves to BindingDB")
+
+    # 9. An axis relation that the schema declares, weights and lists — and that the
+    #    graph never emits — is a hole nothing else can see. `protein_exact` sat at
+    #    weight 1.00 inside AXIS_EDGE_TYPES["protein"] with ZERO edges, so two Protein
+    #    nodes holding the same protein under different accessions were never joined.
+    for et in sorted(set(schema.AXIS_EDGE_TYPES["ligand"]
+                         + schema.AXIS_EDGE_TYPES["protein"])):
+        k = e.filter(pl.col("edge_type") == et).select(pl.len()).collect().item()
+        check(k > 0, f"axis relation `{et}` is actually populated", f"{k:,} edges")
+
+    # 10. protein_exact must NOT swallow the HIV domain split: the 99-aa protease is
+    #     100 % identical to a slice of the 1,447-aa polyprotein, and merging them
+    #     would claim a model that learned protease has learned reverse transcriptase.
+    hiv = (e.filter((pl.col("edge_type") == "protein_exact")
+                    & (pl.col("src").str.contains("HIV1:")
+                       | pl.col("dst").str.contains("HIV1:"))
+                    & (pl.col("props").str.json_path_match("$.alnlen")
+                       .cast(pl.Int64) > 700))
+            .select(pl.len()).collect().item())
+    check(hiv == 0, "protein_exact does not merge an HIV domain into the polyprotein",
+          f"{hiv:,} such edges")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--kg-dir", default="outputs/kg")
+    ap.add_argument("--sample", type=int, default=50_000,
+                    help="scaffolds to re-check with RDKit (0 = all)")
     a = ap.parse_args()
     d = Path(a.kg_dir)
     n = pl.scan_parquet(d / "canonical_nodes.parquet")
@@ -171,6 +317,7 @@ def main() -> int:
           f"{e.select(pl.len()).collect().item():,} edges")
     structural(n, e)
     semantic(n, e)
+    facts(n, e, sample=a.sample or 10**9)
     print(f"\n{len(_fails)} failed check(s)")
     for f in _fails:
         print("  -", f)

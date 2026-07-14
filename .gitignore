@@ -1,0 +1,83 @@
+# ----- data + outputs (never commit) -----
+# Ignore directory contents but keep the parent via .gitkeep.
+data/raw/*
+data/processed/*
+data/MANIFEST.md
+outputs/*
+
+# allow placeholders
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!outputs/.gitkeep
+
+# anything else that might appear
+logs/
+reports/
+figures/
+
+# ----- external clones / model checkpoints -----
+external/
+checkpoints/
+
+# ----- archive + binary formats -----
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.parquet
+*.pkl
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.lmdb
+*.npy
+*.npz
+*.fasta
+*.tsv
+*.db
+*.sqlite
+*.h5
+*.hdf5
+
+# ----- generated CSVs / images -----
+*.csv
+!configs/**/*.csv
+!docs/**/*.csv
+*.png
+*.pdf
+!docs/**/*.png
+!docs/**/*.pdf
+
+# ----- caches + tooling -----
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.eggs/
+*.egg-info/
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# ----- OS junk -----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ----- env directories -----
+.venv/
+venv/
+env/
+.env
+
+# ----- editor / agent local state -----
+.claude/
+.tmp/

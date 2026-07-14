@@ -1,0 +1,29 @@
+name: vsleakkg
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.10
+  - rdkit
+  - openbabel
+  - pandas
+  - polars
+  - duckdb
+  - pyarrow
+  - numpy
+  - scipy
+  - scikit-learn
+  - networkx
+  - tqdm
+  - biopython
+  - requests
+  - beautifulsoup4
+  - typer
+  - rich
+  - python-igraph
+  - leidenalg
+  - pip
+  - pip:
+    - chembl-downloader
+    - pubchempy

@@ -1,0 +1,500 @@
+       VS-LeakKG: A Contamination Knowledge Graph for
+          Leakage-Controlled Virtual Screening Benchmarks
+
+                                             Anonymous Authors
+
+                                                                Abstract
+            Structure-based virtual screening has increasingly been formulated as a protein­ligand re-
+        trieval problem, where protein pockets and candidate ligands are embedded into a shared repre-
+        sentation space and ranked by similarity. Despite strong reported performance on benchmarks
+        such as DUD-E, DEKOIS, and LIT-PCBA, the reliability of these results remains difficult to
+        assess due to potential train­test contamination and benchmark-specific shortcuts. Existing
+        evaluation protocols often remove exact target or ligand overlaps, but they rarely account for
+        indirect leakage through ligand scaffolds, homologous proteins, structurally similar pockets,
+        reused assays, shared publications, source-specific decoy protocols, or temporal overlap.
+            We propose VS-LeakKG, a contamination-aware heterogeneous graph framework for au-
+        diting, constructing, and retraining on leakage-controlled virtual screening benchmarks. VS-
+        LeakKG represents benchmark examples, proteins, pockets, ligands, scaffolds, assays, publi-
+        cations, dataset sources, decoy protocols, and timestamps as typed nodes, with typed edges
+        encoding possible leakage pathways. The graph enables example-level contamination scoring,
+        multi-axis cold split generation, shortcut diagnostics, and clean train/validation/test construc-
+        tion. We further define a retraining protocol in which modern protein­ligand retrieval models
+        are trained and selected only on leakage-controlled partitions. Our framework therefore pro-
+        vides a benchmark-governance layer for virtual screening, allowing models to be evaluated under
+        progressively stricter and reproducible generalization regimes.
+
+1 Introduction
+
+Structure-based virtual screening (SBVS) is a central task in early-stage drug discovery, aiming
+to identify active ligands for a target protein from a large candidate library. Recent contrastive
+protein­ligand models have reformulated SBVS as a retrieval problem, where protein pockets and
+ligands are embedded into a shared representation space and ranked by similarity. This paradigm
+enables efficient large-scale screening and has led to strong reported results on established bench-
+marks such as DUD-E, DEKOIS, and LIT-PCBA.
+
+    However, the reliability of these reported gains remains difficult to assess. Many widely used vir-
+tual screening benchmarks contain hidden shortcuts that can inflate performance without requiring
+models to learn true protein­ligand interactions. For instance, DUD-E-style benchmarks construct
+property-matched but topologically dissimilar decoys, allowing ligand-only models to distinguish
+actives from decoys by exploiting chemical artifacts rather than binding mechanisms. In addition,
+modern protein­ligand models are often trained or pretrained on large heterogeneous resources
+such as ChEMBL, BindingDB, PDBBind, and PubChem-derived datasets. These sources overlap
+with downstream benchmarks through multiple indirect channels, including shared ligands, similar
+scaffolds, homologous proteins, structurally similar pockets, reused assays, common publications,
+and source-specific decoy generation protocols. As a result, a benchmark example may appear
+"unseen" at the level of an exact protein­ligand pair while still being highly contaminated through
+its ligand scaffold, protein family, binding pocket, or assay provenance.
+
+                                                                1
+    Existing efforts address important parts of this problem, but none fully captures the multi-axis
+contamination structure of virtual screening. DrugOOD studies out-of-distribution generalization
+for drug­target affinity prediction using domain annotations such as assay, scaffold, protein, and
+protein family. DataSAIL provides a general-purpose framework for leakage-reduced splitting in
+biological datasets by minimizing similarity across partitions. Recent leakage-aware protein­ligand
+benchmarks such as LP-PDBBind and CleanSplit focus on binding affinity or scoring-function
+evaluation. BayesBind moves closer to SBVS by constructing a benchmark with targets structurally
+dissimilar from the training set. These works demonstrate the importance of rigorous evaluation,
+but they do not explicitly model virtual-screening contamination as a typed, high-order relational
+structure across proteins, pockets, ligands, scaffolds, assays, sources, decoy protocols, and time.
+
+    We argue that virtual screening requires a benchmark-governance framework rather than an-
+other single benchmark split. In particular, train­test contamination should be treated as a het-
+erogeneous graph problem: examples are connected through biological, chemical, structural, ex-
+perimental, and provenance relations, and leakage may occur through short paths in this graph.
+Such a formulation enables three complementary capabilities. First, it enables dataset auditing
+through example-level and axis-specific contamination scores. Second, it enables construction of
+train/validation/test splits that explicitly forbid leakage paths across predefined axes. Third, it
+enables controlled retraining of modern protein­ligand retrieval models under the same leakage-
+controlled protocol, so that performance reflects generalization rather than overlap with the training
+data or validation leakage during model selection.
+
+    To this end, we propose VS-LeakKG, a contamination-aware heterogeneous graph framework
+for auditing and constructing leakage-controlled virtual screening benchmarks. Unlike biomedical
+knowledge graphs designed for link prediction or drug repurposing, VS-LeakKG is designed for
+benchmark integrity: its nodes and edges encode potential leakage pathways between training,
+validation, and test examples. Using this graph, we quantify contamination along ligand, scaffold,
+protein, pocket, assay, source, and temporal axes; generate clean multi-axis train/validation/test
+splits; retrain representative SBVS models on the resulting partitions; and evaluate whether current
+methods continue to outperform shortcut baselines when contamination is controlled.
+
+2 Contributions
+
+Our main contributions are as follows.
+
+· A contamination knowledge graph for virtual screening. We introduce VS-LeakKG, a
+   typed heterogeneous graph that connects benchmark examples to proteins, protein families, bind-
+   ing pockets, pocket clusters, ligands, molecular scaffolds, assays, publications, dataset sources,
+   decoy protocols, and timestamps. Unlike conventional biomedical knowledge graphs that are pri-
+   marily used for prediction, VS-LeakKG is constructed to expose potential train­validation­test
+   leakage pathways in virtual screening benchmarks.
+
+· Example-level and axis-specific contamination scoring. We define a path-based contam-
+   ination score that measures how strongly an example is connected to a reference split through
+   high-confidence leakage paths. The score is decomposed into ligand-level, scaffold-level, protein-
+   level, pocket-level, assay-level, source-level, and temporal components, allowing us to identify
+   not only whether a benchmark is contaminated, but also which type of shortcut dominates.
+
+· Leakage-controlled train/validation/test split construction. We propose a graph-based
+   split construction procedure that first collapses examples connected by forbidden leakage paths
+
+                                                                2
+   into leakage groups, and then partitions these groups into train, validation, and test sets. This
+   ensures that validation and test examples are not connected to the training set through explicitly
+   defined ligand, scaffold, protein, pocket, assay, source, or temporal leakage axes. The resulting
+   splits include ligand-clean, scaffold-clean, protein-clean, pocket-clean, dual-clean, and strict-
+   clean regimes.
+
+· Model retraining under clean splits. We define a retraining protocol for modern protein­
+   ligand retrieval models in which model fitting, hyperparameter selection, and final testing are
+   all performed on VS-LeakKG-clean partitions. This protocol distinguishes leakage in training
+   data from leakage in validation-based checkpoint selection, and allows fair comparison between
+   models under the same cold-start assumptions.
+
+· Shortcut diagnostics for benchmark validity. We introduce diagnostic baselines that re-
+   quire little or no protein­ligand interaction modeling, including ligand-only predictors, source-
+   only predictors, contamination-nearest-neighbor predictors, and dummy-receptor controls. These
+   diagnostics test whether high virtual screening performance can be achieved by exploiting chem-
+   ical, source, or relational artifacts rather than learning structure-based binding signals.
+
+· A systematic re-evaluation of modern protein­ligand retrieval models. We apply
+   VS-LeakKG to audit established and modern virtual screening benchmarks, including DUD-E,
+   LIT-PCBA, and BayesBind-style settings, and re-evaluate representative retrieval-based models
+   such as DrugCLIP, S2Drug, LigUnity, HypSeek, and ConGLUDe. We report standard metrics
+   such as AUROC, BEDROC, and enrichment factors, as well as contamination-aware metrics such
+   as performance by contamination decile, worst-group performance, clean-split performance, and
+   the gap between interaction-based models and shortcut baselines.
+
+· Evidence that benchmark conclusions depend on contamination control. Through
+   contamination-aware evaluation and clean-split retraining, we test whether model rankings and
+   absolute performance change when ligand, scaffold, protein, pocket, assay, source, and temporal
+   leakage are controlled simultaneously. These findings motivate measuring progress in virtual
+   screening with benchmark-integrity diagnostics rather than only aggregate enrichment metrics
+   on legacy decoy-based benchmarks.
+
+3 Method
+
+3.1 Problem Formulation
+
+Let a virtual screening corpus consist of a set of examples
+
+                                D = {xi}Ni=1.
+
+Each example is represented as
+
+                                xi = (pi, bi, i, yi, si),
+
+where pi denotes a target protein, bi denotes a binding pocket or predicted pocket, i denotes
+a ligand, yi  {0, 1} denotes the active/inactive label, and si denotes metadata such as assay,
+publication, dataset source, timestamp, and decoy protocol.
+
+    A conventional benchmark split partitions the corpus into training, validation, and test subsets:
+
+                                D = Dtrain  Dval  Dtest.
+
+                                3
+However, this split may still be contaminated if validation or test examples are connected to the
+training set through ligand similarity, scaffold identity, protein homology, pocket similarity, assay
+reuse, shared publications, source-specific decoy protocols, or temporal overlap. Our goal is twofold:
+(i) to quantify this contamination in existing benchmarks, and (ii) to construct leakage-controlled
+train/validation/test splits for retraining and evaluating virtual screening models.
+
+3.2 Constructing the Contamination Knowledge Graph
+
+We construct a typed heterogeneous graph
+
+                                                       G = (V, E, R),
+
+where V denotes nodes, E denotes edges, and R denotes edge types. The graph contains multiple
+node types relevant to virtual screening contamination.
+
+Node type                 Table 1: Main node types in VS-LeakKG.
+                Description
+
+Example         A benchmark protein­ligand screening example
+Protein         Target protein, e.g., UniProt or PDB chain
+ProteinCluster  Sequence or family cluster, e.g., 30%, 40%, 90% identity clusters
+Pocket          Binding pocket or predicted pocket
+PocketCluster   Cluster of structurally or representationally similar pockets
+Ligand          Canonical molecule, e.g., InChIKey or canonical SMILES
+Scaffold        Molecular scaffold, e.g., Bemis­Murcko scaffold
+Assay           Experimental assay from ChEMBL, BindingDB, PubChem, or other sources
+Publication     Paper or source record associated with a measurement
+DatasetSource   Dataset origin, e.g., DUD-E, LIT-PCBA, PDBBind, ChEMBL
+DecoyProtocol   Decoy generation protocol or inactive-labeling process
+TimeBin         Timestamp or temporal interval
+
+    Edges encode possible leakage pathways. For example, an example_has_ligand edge con-
+nects an example to its ligand, a ligand_has_scaffold edge connects a ligand to its scaffold,
+and a protein_in_cluster edge connects a protein to a sequence-identity cluster. Additional
+edges encode ligand Tanimoto similarity, pocket similarity, common assay membership, common
+publication, common data source, and shared decoy protocol.
+
+    Each edge type r  R is assigned a leakage weight wr  [0, 1], where larger values indicate
+stronger evidence of potential contamination. For instance, exact ligand identity receives a larger
+weight than scaffold similarity, and exact protein identity receives a larger weight than family-level
+similarity.
+
+3.3 Path-Based Contamination Scoring
+
+Given an example xt and a reference set A, such as a training split, we define the contamination
+of xt with respect to A as the strength of the strongest leakage path connecting it to any example
+in A. Let PL(xi, xt) denote the set of typed paths of length at most L between xi  A and xt in
+G. The score of a path  is defined as
+
+                                                     S() = wr(e),
+
+                                                                                       e
+
+                                                                4
+where r(e) is the type of edge e. The overall contamination score is
+
+                                           C(xt, A) = max max S().
+
+                                                                               xiA PL(xi,xt)
+
+    This score captures both exact and indirect contamination. For example, an exact ligand
+overlap corresponds to a short high-weight path, while scaffold overlap or protein-family overlap
+corresponds to a lower-weight but still meaningful path. In practice, we compute both a global
+contamination score and axis-specific scores:
+
+                  C(xt, A) = max{Cligand, Cscaffold, Cprotein, Cpocket, Cassay, Csource, Ctime}.
+
+This decomposition allows us to diagnose which form of contamination dominates each benchmark
+or split.
+
+3.4 Forbidden Leakage Relations
+
+To construct clean train/validation/test partitions, we define a set of forbidden leakage relations
+F  R. These are relations that are not allowed to connect examples across train, validation, and
+test partitions. The strictest setting includes exact ligand identity, scaffold identity, high ligand
+similarity, exact protein identity, sequence-cluster membership, pocket-cluster membership, assay
+overlap, publication overlap, source-specific decoy protocol overlap, and invalid temporal ordering.
+
+      Table 2: Forbidden relations used to construct VS-LeakKG-clean splits.
+
+Axis                 Forbidden relation                           Purpose
+
+Ligand               Same InChIKey                                Prevent exact compound memorization
+Scaffold             Same Bemis­Murcko scaffold                   Prevent scaffold-level memorization
+Chemical similarity  Morgan Tanimoto above threshold              Prevent near-duplicate ligand leakage
+Protein              Same UniProt or PDB chain                    Prevent exact target leakage
+Protein family       Same sequence cluster                        Prevent homologous target leakage
+Pocket               Same or highly similar pocket cluster        Prevent binding-site leakage
+Assay                Same assay identifier                        Prevent assay-specific leakage
+Publication          Same source document                         Prevent publication-level leakage
+Source/protocol      Same artificial decoy protocol               Prevent benchmark-source shortcuts
+Time                 Test timestamp earlier than train timestamp  Prevent temporal leakage
+
+    The choice of F defines the evaluation regime. A scaffold-clean split forbids scaffold relations;
+a protein-clean split forbids protein-cluster relations; a strict-clean split forbids all high-confidence
+relations in Table 2.
+
+3.5 Leakage Group Construction
+
+Given the full graph G and the forbidden relation set F, we construct a forbidden subgraph
+                                     GF = (V, EF ), EF = {e  E : r(e)  F }.
+
+We then compute connected components over benchmark examples induced by GF . Each connected
+component defines a leakage group
+
+                 gm = {xi : xi is connected to other examples through forbidden paths}.
+
+                                                                5
+All examples in the same leakage group must be assigned to the same partition. This prevents
+a scaffold, protein cluster, pocket cluster, assay, or source-specific group from being split across
+training and testing.
+
+    This group-level construction is the key step that converts graph contamination into a practical
+clean split. Rather than checking only pairwise exact duplicates after splitting, VS-LeakKG pre-
+vents leakage before model training by ensuring that entire leakage groups are assigned atomically.
+
+3.6 Leakage-Controlled Train/Validation/Test Split
+
+Let Ggrp = {g1, . . . , gM } denote the leakage groups. We assign each group to one of three partitions:
+
+     zm  {train, val, test}.
+
+The resulting example-level split is obtained by assigning all xi  gm to zm.
+    We formulate the group assignment as a constrained optimization problem:
+
+min  gm ,gn Ggrp                           C(xj, {xi}),
+
+  z                          xigm xj gn
+
+     zm=train, zn{val,test}
+
+subject to label balance and benchmark-utility constraints:
+
+|Dk+| - |D+|  , k  {train, val, test},
+|Dk| |D|
+
+where D+ denotes active examples. Additional constraints enforce minimum numbers of targets,
+ligands, active compounds, inactive compounds, and screening candidates in validation and test.
+
+    In practice, we use a two-stage procedure. First, leakage groups are constructed by connected
+components under F. Second, groups are assigned to train/validation/test using a greedy or
+integer-programming-based heuristic that preserves the desired split ratio while minimizing residual
+cross-partition contamination. We explicitly report residual contamination after splitting, rather
+than claiming that the split is leakage-free in an absolute sense.
+
+    The resulting splits are released under multiple regimes:
+
+· Ligand-clean: exact ligand overlap is forbidden across partitions.
+
+· Scaffold-clean: scaffold overlap is forbidden across partitions.
+
+· Protein-clean: proteins from the same sequence cluster are assigned to the same partition.
+
+· Pocket-clean: similar pocket clusters are assigned to the same partition.
+
+· Assay-clean: examples from the same assay or publication are assigned to the same partition.
+
+· Dual-clean: both ligand/scaffold and protein/pocket contamination are controlled.
+
+· Strict-clean: ligand, scaffold, protein, pocket, assay, source, protocol, and temporal contami-
+   nation are controlled simultaneously.
+
+                  6
+3.7 Clean-Split Model Retraining Protocol
+
+After constructing VS-LeakKG-clean partitions, we retrain protein­ligand retrieval models using
+the same split for all methods. For a model f, training is performed only on Dtrain:
+
+                                                = arg min L(f; Dtrain).
+
+                                                                                    
+
+Hyperparameters and checkpoints are selected using only the leakage-controlled validation split:
+
+                                                ^ = arg max M (f; Dval),
+
+                                                                                 
+
+where M is a validation metric such as BEDROC or EF1%. Final results are reported once on Dtest:
+
+                                                   Score = M (f^; Dtest).
+This protocol prevents leakage not only in final testing, but also in model selection. We therefore
+distinguish two failure modes: training contamination, where test-like examples are present in
+the training set, and validation contamination, where checkpoint selection is biased by validation
+examples that are too close to training or test examples.
+
+    For models that use both structure-based and ligand-based data, such as unified protein­ligand
+retrieval models, both data streams are filtered through the same VS-LeakKG split. Structure-
+based complexes are assigned according to their protein, pocket, and ligand groups; ligand-based
+assay records are assigned according to assay, ligand, scaffold, protein, publication, and temporal
+groups. This ensures that pretraining and fine-tuning data do not leak into validation or test
+through different data modalities.
+
+3.8 Shortcut Diagnostic Baselines
+
+A key use of VS-LeakKG is to test whether benchmark performance can be achieved without
+modeling protein­ligand interactions. We introduce four diagnostic baselines.
+
+Ligand-only baseline. This baseline uses only ligand fingerprints, scaffold identity, or physic-
+ochemical descriptors to classify active and inactive compounds. Strong performance from this
+baseline indicates that the benchmark contains ligand-side or decoy-selection artifacts.
+
+Source-only baseline. This baseline uses only dataset source, assay type, publication, or decoy
+protocol. Strong performance indicates source-specific label artifacts.
+
+Contamination nearest-neighbor baseline. For a test example xt, this baseline finds the most
+contaminated training example:
+
+                                              x = arg max C(xt, {xi}),
+
+                                                                               xi Dtrain
+
+and transfers its label or ranking score to xt. If this baseline performs competitively with deep
+protein­ligand models, then relational leakage alone may explain a substantial fraction of bench-
+mark performance.
+
+Dummy-receptor baseline. This baseline replaces the true protein or pocket with a fixed
+dummy receptor representation while preserving ligand information. Strong performance indicates
+that the model does not rely on target-specific structural information.
+
+                                                                7
+3.9 Evaluation Protocol
+
+We evaluate models under both legacy and clean-split regimes. Given a query protein or pocket,
+each model ranks candidate ligands by a predicted score. We report standard virtual screening
+metrics:
+
+                               AUROC, BEDROC, EF0.5%, EF1%, EF5%.
+In addition, we report contamination-aware metrics:
+
+· contamination distribution before and after clean split construction;
+
+· performance by contamination decile;
+
+· worst-group performance over scaffold, protein-family, pocket-cluster, assay, and source groups;
+
+· model ranking changes from legacy evaluation to strict-clean retraining;
+
+· relative gap between interaction-based models and shortcut baselines;
+
+· validation-leakage effect, measured by comparing checkpoint selection on leaked versus clean
+   validation splits.
+
+    This evaluation distinguishes four possible outcomes. First, if a model performs well only in
+high-contamination regimes, its apparent success may be driven by memorization or shortcut learn-
+ing. Second, if ligand-only or source-only baselines remain competitive, the benchmark may not
+require structure-based interaction modeling. Third, if a model performs well on legacy evaluation
+but drops substantially after clean-split retraining, then the legacy benchmark likely overestimates
+generalization. Fourth, if a model maintains strong performance under strict-clean splits and con-
+sistently outperforms shortcut baselines, this provides stronger evidence of genuine protein­ligand
+generalization.
+
+3.10 Optional: Contamination-Aware Training
+
+Although the primary goal of VS-LeakKG is benchmark governance and clean evaluation, the
+graph can also guide model training. We define contamination-aware contrastive learning by select-
+ing hard negatives using graph relations. For a positive protein­ligand pair (bi, i), hard negatives
+are selected from ligands that are chemically similar but experimentally inactive, or from ligands
+connected through scaffolds but not known to bind the same pocket.
+
+    A general training objective can be written as
+
+                         L = Lcontrastive + 1Lsource-adv + 2LgroupDRO + 3LKG-hard,
+
+where Lsource-adv discourages the representation from encoding dataset-source shortcuts, LgroupDRO
+improves worst-group performance across scaffold, protein, pocket, and assay groups, and LKG-hard
+encourages discrimination among graph-selected hard negatives. This extension is optional; the
+core contribution of VS-LeakKG remains the contamination-aware benchmark construction and
+clean-split retraining framework.
+
+                                                                8
+4 Discussion
+
+The proposed framework differs from existing virtual screening benchmarks in both goal and rep-
+resentation. DUD-E, DEKOIS, LIT-PCBA, and BayesBind provide specific benchmark datasets,
+while VS-LeakKG provides a general mechanism for auditing, constructing, and retraining on
+benchmark splits. DrugOOD and DataSAIL address out-of-distribution evaluation and leakage-
+reduced splitting in broader biological machine learning settings, but they do not explicitly model
+the typed contamination pathways that arise in structure-based virtual screening. Biomedical
+knowledge graphs such as Hetionet and PrimeKG integrate biological knowledge for prediction and
+reasoning, whereas VS-LeakKG uses a heterogeneous graph as a benchmark-integrity object.
+
+    This distinction is important because virtual screening contamination is inherently multi-relational.
+A benchmark can be clean along one axis while contaminated along another. For example, a test
+protein may be absent from training but belong to a highly similar pocket cluster; a test ligand
+may be unique but share a scaffold with many training ligands; or a target-fishing experiment
+may be held out as a dataset while many of its ligands already appear in ChEMBL. By exposing
+these paths explicitly, VS-LeakKG enables more transparent and reliable assessment of progress
+in virtual screening.
+
+    The clean-split retraining protocol is equally important. Auditing existing benchmarks can re-
+veal potential contamination, but retraining under graph-controlled partitions tests whether models
+continue to generalize once those pathways are removed. This turns VS-LeakKG from a diagnostic
+tool into a reusable benchmark construction framework. The resulting evaluation does not claim
+to remove all possible sources of leakage; instead, it makes the controlled axes explicit, quantifies
+residual contamination, and provides a reproducible basis for comparing virtual screening models
+under well-defined cold-start assumptions.
+
+5 Conclusion
+
+We presented VS-LeakKG, a contamination-aware heterogeneous graph framework for reliable
+virtual screening evaluation and clean benchmark construction. The framework models train­
+validation­test contamination as typed paths across ligands, scaffolds, proteins, pockets, assays,
+sources, decoy protocols, and time. It supports example-level contamination scoring, leakage-
+group construction, multi-axis train/validation/test splitting, shortcut diagnostics, and clean-split
+retraining of modern protein­ligand retrieval models. By shifting the focus from single benchmark
+scores to benchmark integrity and leakage-controlled retraining, VS-LeakKG aims to provide a
+more reliable basis for measuring progress in structure-based virtual screening.
+
+References
+
+ [1] Jiasheng Ji, et al. DrugOOD: Out-of-Distribution Dataset Curator and Benchmark for AI-
+      Aided Drug Discovery. In AAAI, 2023.
+
+ [2] DataSAIL Authors. DataSAIL: Leakage-reduced data splitting for biological machine learning.
+      Nature Communications, 2025.
+
+ [3] BayesBind Authors. BayesBind: A benchmark for structure-based virtual screening under
+      reduced training-set leakage. Preprint, 2024.
+
+ [4] Pang Wei Koh, et al. WILDS: A benchmark of in-the-wild distribution shifts. In ICML, 2021.
+
+                                                                9
+ [5] Ishaan Gulrajani and David Lopez-Paz. In Search of Lost Domain Generalization. In ICLR,
+      2021.
+
+ [6] Graph OOD Benchmark Authors. GOOD: A Graph Out-of-Distribution Benchmark. In
+      NeurIPS Datasets and Benchmarks, 2022.
+
+ [7] Xiang Wang, et al. KGAT: Knowledge Graph Attention Network for Recommendation. In
+      KDD, 2019.
+
+ [8] Daniel S. Himmelstein, et al. Systematic integration of biomedical knowledge prioritizes drugs
+      for repurposing. eLife, 2017.
+
+ [9] Payal Chandak, et al. Building a knowledge graph to enable precision medicine. Scientific
+      Data, 2023.
+
+[10] Michael M. Mysinger, et al. Directory of Useful Decoys, Enhanced (DUD-E): Better ligands
+      and decoys for better benchmarking. Journal of Medicinal Chemistry, 2012.
+
+[11] LIT-PCBA Authors. LIT-PCBA: An unbiased data set for machine learning and virtual
+      screening. 2020.
+
+                                                               10
+

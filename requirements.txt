@@ -1,0 +1,6 @@
+# pip-only packages for VS-LeakKG.
+# Prefer the conda environment in environment.yml for native deps (rdkit, openbabel,
+# python-igraph, leidenalg). Install these on top of that env, or alone if you have
+# the system libs already.
+chembl-downloader
+pubchempy

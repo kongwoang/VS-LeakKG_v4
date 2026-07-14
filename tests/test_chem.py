@@ -77,6 +77,52 @@ def test_parent_inchikey_invalid_returns_none():
 
 
 # ---------------------------------------------------------------------------
+# The three variants `ligand_parent_exact` exists to bridge.
+#
+# These tests are new because the old suite passed on a `parent_inchikey` that
+# stripped salts and nothing else — so it caught the salt case above (the one it
+# tested) and missed the two it did not. On the shipped KG the relation came out a
+# 100 % duplicate of `ligand_exact` (6,939 == 6,939, identical pairs): it bridged
+# ZERO of the variants it exists for, while 41,238 pairs of Ligand nodes that are the
+# same compound sat in the graph with no edge between them at all.
+#
+# A test suite that only tests the case that works is how that survives.
+# ---------------------------------------------------------------------------
+
+
+def test_parent_inchikey_bridges_protonation():
+    """A protonated amine and its neutral twin are the same compound.
+
+    RDKit's SaltRemover deletes counterions; it does NOT neutralise a charge. The
+    corpora disagree here because their loaders sanitise differently — see
+    fixes.one_scaffold_per_ligand, which documents exactly this drift on N-oxides.
+    """
+    charged = "C[NH+]1CCN(c2ccccc2)CC1"
+    neutral = "CN1CCN(c2ccccc2)CC1"
+    assert vc.parent_inchikey(charged) == vc.parent_inchikey(neutral)
+    # ...and they are NOT the same molecule to the full InChIKey, which is why the
+    # bridge has to exist at all.
+    assert vc.inchikey(charged) != vc.inchikey(neutral)
+
+
+def test_parent_inchikey_bridges_stereo():
+    """Two stereoisomers share a parent. ECFP4 is chirality-blind and already scores
+    them as identical (weight 0.95); the identity relation must not contradict that."""
+    r = "N[C@@H](C)C(=O)O"
+    s = "N[C@H](C)C(=O)O"
+    assert vc.parent_inchikey(r) == vc.parent_inchikey(s)
+    assert vc.inchikey(r) != vc.inchikey(s)
+
+
+def test_parent_inchikey_does_not_merge_different_compounds():
+    """The bridge must not become a sledgehammer: unrelated molecules stay apart."""
+    assert vc.parent_inchikey("CCO") != vc.parent_inchikey("CCC")
+    # one methyl apart is still a different compound
+    assert vc.parent_inchikey("CN1CCN(c2ccccc2)CC1") != \
+           vc.parent_inchikey("CCN1CCN(c2ccccc2)CC1")
+
+
+# ---------------------------------------------------------------------------
 # Parallel batch order preservation + length contract
 # ---------------------------------------------------------------------------
 

@@ -81,3 +81,22 @@ env/
 # ----- editor / agent local state -----
 .claude/
 .tmp/
+
+# ----- protein axis: derived, but from sources that can VANISH -----
+# These are outputs, and normally outputs do not belong in git. They are here
+# because the code that produces them reaches out to three external services —
+# dude.docking.org for DUD-E's receptor.pdb, UniProt REST, RCSB — and the whole
+# protein axis (protein_id_map -> MMseqs clusters -> protein_exact -> every
+# protein-axis leakage number) hangs on all three still being up, still serving the
+# same paths, and still not blocking VUW's IP. For a paper that is not an ops risk,
+# it is a reproducibility hole: the day dude.docking.org goes away, the graph cannot
+# be rebuilt and nothing says so louder than "resolved 0/102 receptors".
+# Together they are under 4 MB. Commit them.
+!data/processed/target_uniprot_map.parquet
+!data/processed/protein_id_map.parquet
+!data/processed/chembl_target_accessions.parquet
+!data/processed/protein_exact.parquet
+!data/processed/protein_clusters_30.parquet
+!data/processed/protein_clusters_50.parquet
+!data/processed/protein_clusters_90.parquet
+!data/processed/all_proteins.fasta

@@ -884,9 +884,25 @@ def consolidate(
              n_split, n_measured)
 
     # ChEMBL doc_type=DATASET is a placeholder, not a publication.
-    edges, n_ph = _fixes.drop_placeholder_publications(
-        nodes, edges,
-        Path("data/raw/ChEMBL/extracted/chembl_35/chembl_35_sqlite/chembl_35.db"))
+    #
+    # This path used to be the string literal
+    # "data/raw/ChEMBL/extracted/chembl_35/chembl_35_sqlite/chembl_35.db" — RELATIVE to
+    # the current working directory. Run consolidate from anywhere but the repo root and
+    # the database is not found, `drop_placeholder_publications` logs a warning and
+    # returns unchanged, and the KG ships with `CHEMBL1201862` ("PubChem BioAssay data
+    # set") joining 1,730,288 Examples — 34 % of the graph — through a single
+    # Publication node. The publication axis collapses to one group covering 95 % of the
+    # corpus, and the only sign is one warning line in a log nobody reads.
+    # The module already has `raw_dir()`. Use it.
+    chembl_db = (require_data_root() / "data" / "raw" / "ChEMBL" / "extracted"
+                 / "chembl_35" / "chembl_35_sqlite" / "chembl_35.db")
+    if not chembl_db.exists():
+        raise FileNotFoundError(
+            f"ChEMBL DB not found at {chembl_db}. Placeholder DATASET documents cannot "
+            f"be filtered, and leaving them in collapses the publication axis into one "
+            f"group covering 95 % of the corpus. Refusing to build a KG that would be "
+            f"quietly wrong.")
+    edges, n_ph = _fixes.drop_placeholder_publications(nodes, edges, chembl_db)
     log.info("dropped %d publication edges to placeholder DATASET docs", n_ph)
 
     # Universal orphan drop: any node with degree 0 after the dangling-edge

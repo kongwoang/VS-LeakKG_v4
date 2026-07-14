@@ -4,7 +4,13 @@ Node tables share columns: node_id (str), node_type (str), label (str), props (U
 Edge tables share columns: src (str), dst (str), edge_type (str), props (Utf8 JSON).
 
 Node IDs are typed prefixes so the union of node tables remains a flat namespace:
-  ex:<source>:<row_index>          Example
+  ex:<source>:<target>:<row_index>  Example  — FOUR fields, not three. The docstring
+                                     said three; `build_graph.example_id()` has always
+                                     written four, and `fixes.split_example_protein_
+                                     relation` PARSES fields 1 and 2 to recover the
+                                     target. Anyone who trusted this line and dropped
+                                     the target field would silently break the protein
+                                     axis for every corpus.
   lig:<canonical_smiles_md5>       Ligand
   sca:<scaffold_smiles_md5>        Scaffold
   tgt:<source>:<target_name>       ProteinTarget

@@ -236,8 +236,26 @@ def groups(ex_mid: pl.DataFrame, rels: list[pl.DataFrame], label: str, cut: int 
 print("\n   khối nguyên tử lớn nhất (phải nằm trọn một bên train/test).")
 print("   `cut` = bỏ node trung gian có bậc > cut. KG KHÔNG chọn ngưỡng hộ bạn — đây là đường cong:")
 ehl = pairs("example_has_ligand").rename({"src": "ex", "dst": "mid"})
-groups(ehl, [pairs(t) for t in ("ligand_exact", "ligand_parent_exact",
-                                "ligand_fingerprint_exact", "ligand_similar")], "ligand", None)
+
+# Trục ligand: quét theo NGƯỠNG TANIMOTO, không chỉ một con số.
+#
+# KG ghi `ligand_similar` từ 0.80 trở lên và cất giá trị Tanimoto vào `props` — ngưỡng
+# là CHÍNH SÁCH của downstream. Nhưng ghi ở 0.80 làm đồ thị ligand dày hơn hẳn so với
+# 0.85 (bản cũ vô tình chạy ở 0.85), và cộng thêm 234K cạnh `ligand_parent_exact` vừa
+# được cứu, khối liên thông có thể phình to tới mức trục ligand KHÔNG chia được nữa.
+# Đó không phải lý do để ghi ít đi — đó là lý do để BÁO RA ĐƯỜNG CONG, y như trục
+# assay đã làm với `cut`. Ai đọc bảng này thì tự chọn ngưỡng, và nhìn thấy cái giá.
+_sim = (e.filter(pl.col("edge_type") == "ligand_similar")
+         .select("src", "dst",
+                 pl.col("props").str.json_path_match("$.tanimoto")
+                   .cast(pl.Float64).alias("t")).collect())
+_idt = [pairs(t) for t in ("ligand_exact", "ligand_parent_exact",
+                           "ligand_fingerprint_exact")]
+print("   trục ligand — khối lớn nhất theo NGƯỠNG TANIMOTO:")
+for tmin in (0.80, 0.85, 0.90, 0.95, 1.01):   # 1.01 = chỉ các quan hệ ĐỒNG NHẤT
+    sub = _sim.filter(pl.col("t") >= tmin).select("src", "dst")
+    lbl = "ligand (chỉ identity)" if tmin > 1.0 else f"ligand T>={tmin:.2f}"
+    groups(ehl, _idt + ([sub] if sub.height else []), lbl, None)
 lsc = pairs("ligand_scaffold")
 ex_sc = ehl.join(lsc, left_on="mid", right_on="src").select(
     "ex", pl.col("dst").alias("mid")).unique()

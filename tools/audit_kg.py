@@ -38,6 +38,9 @@ ENDPOINTS = {
     # named source_*, but emitted example-level
     "source_decoy_protocol":    ("Example", "DecoyProtocol"),
     "decoy_protocol_in_class":  ("DecoyProtocol", "DecoyProtocolClass"),
+    # Facts about the example, in no axis (schema.NON_AXIS_EDGE_TYPES).
+    "example_in_split":         ("Example", "Split"),
+    "example_has_label_type":   ("Example", "LabelType"),
 }
 PAIR_TYPES = ["ligand_exact", "ligand_parent_exact",
               "ligand_fingerprint_exact", "ligand_similar", "protein_exact"]
@@ -286,10 +289,16 @@ def facts(n: pl.LazyFrame, e: pl.LazyFrame, *, sample: int) -> None:
     #    graph never emits — is a hole nothing else can see. `protein_exact` sat at
     #    weight 1.00 inside AXIS_EDGE_TYPES["protein"] with ZERO edges, so two Protein
     #    nodes holding the same protein under different accessions were never joined.
-    for et in sorted(set(schema.AXIS_EDGE_TYPES["ligand"]
-                         + schema.AXIS_EDGE_TYPES["protein"])):
-        k = e.filter(pl.col("edge_type") == et).select(pl.len()).collect().item()
-        check(k > 0, f"axis relation `{et}` is actually populated", f"{k:,} edges")
+    #
+    #    This loop used to cover the ligand and protein axes only, which is how the
+    #    TIME axis stayed empty without ever failing an audit: TimeBin,
+    #    example_has_timebin and time_overlap are declared, weighted (1.00 and 0.40)
+    #    and listed in AXES, and the graph has never contained one of them. Every
+    #    axis is checked now. An axis with no edges is not an axis.
+    for axis in sorted(schema.AXIS_EDGE_TYPES):
+        for et in sorted(set(schema.AXIS_EDGE_TYPES[axis])):
+            k = e.filter(pl.col("edge_type") == et).select(pl.len()).collect().item()
+            check(k > 0, f"[{axis}] axis relation `{et}` is populated", f"{k:,} edges")
 
     # 10. protein_exact must NOT swallow the HIV domain split: the 99-aa protease is
     #     100 % identical to a slice of the 1,447-aa polyprotein, and merging them
@@ -302,6 +311,34 @@ def facts(n: pl.LazyFrame, e: pl.LazyFrame, *, sample: int) -> None:
             .select(pl.len()).collect().item())
     check(hiv == 0, "protein_exact does not merge an HIV domain into the polyprotein",
           f"{hiv:,} such edges")
+
+    # 11. `label` is 0/1 and cannot tell the three kinds of negative apart. A DUD-E
+    #     property-matched decoy, a LIT-PCBA measured inactive and a BayesBind random
+    #     molecule are all label 0, and consolidate used to drop the one relation that
+    #     separated them ("LabelType — static lookup table"). Without it the decoy-bias
+    #     question is not even expressible. Every Example must carry a label type.
+    ex = n.filter(pl.col("node_type") == "Example")
+    n_ex = ex.select(pl.len()).collect().item()
+    for field, expect in (("label_type", {"active", "decoy", "inactive", "random"}),
+                          ("split", None)):
+        got = (ex.select(pl.col("props").str.json_path_match(f"$.{field}").alias("v"))
+                 .collect())
+        n_null = int(got["v"].null_count())
+        check(n_null == 0, f"every Example carries `{field}` in its props",
+              f"{n_null:,} of {n_ex:,} Examples have no {field}")
+        if expect is not None and n_null == 0:
+            vals = set(got["v"].unique().to_list())
+            check(vals == expect, "label_type has exactly the four corpus values",
+                  f"got {sorted(vals)}, expected {sorted(expect)}")
+
+    # 12. ...and the fix for #11 must not become a leak of its own. `lt:decoy` has
+    #     degree 1.5 M: an axis that traversed it would join every decoy to every
+    #     other decoy at weight 1.00 and score the corpus as totally contaminated.
+    #     These edge types belong in the graph and in no axis.
+    in_axis = {et for types in schema.AXIS_EDGE_TYPES.values() for et in types}
+    leaked = sorted(schema.NON_AXIS_EDGE_TYPES & in_axis)
+    check(not leaked, "no non-axis edge type has been added to an axis",
+          f"{leaked} would connect every example sharing the attribute")
 
 
 def main() -> int:

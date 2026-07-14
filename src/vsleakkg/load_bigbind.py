@@ -45,6 +45,76 @@ from vsleakkg import build_graph as vb
 
 _BIGBIND_ACTIVITIES_DEFAULT = "activities_all.csv"
 
+# BigBind ships its split as three files that partition activities_all.csv exactly
+# (439,368 + 35,596 + 107,993 = 582,957, verified: zero rows in one and not the
+# other, zero duplicate rows within all). The loader used to stamp
+# `split = "unknown"` on every row regardless — so BigBind's published split, which
+# is built to hold NO ligand and NO pocket similarity across its boundaries, was
+# absent from the graph. That split is a debiased baseline independent of LIT-PCBA's
+# AVE, and losing it costs an entire experiment.
+_BIGBIND_SPLIT_FILES: dict[str, str] = {
+    "train": "activities_train.csv",
+    "val": "activities_val.csv",
+    "test": "activities_test.csv",
+}
+
+
+def _row_key(df: pl.DataFrame) -> pl.Series:
+    """A key identifying a raw CSV row by its full content.
+
+    Joining on the parsed columns would be wrong: polars does not match null to
+    null, so every row with a null pchembl_value would silently fail to join and
+    come back with no split. Read every column as text instead (empty field -> "",
+    never null) and concatenate with a separator that cannot occur in a CSV field.
+    """
+    return pl.concat_str(df.columns, separator="\x1f")
+
+
+def _read_keys(path: Path) -> pl.DataFrame:
+    raw = pl.read_csv(path, infer_schema_length=0, missing_utf8_is_empty_string=True)
+    return raw.select(_row_key(raw).alias("_rowkey"))
+
+
+def _assign_split(df: pl.DataFrame, meta_dir: Path, csv_path: Path,
+                  log: logging.Logger) -> pl.DataFrame:
+    """Attach BigBind's published split to `df`, preserving row order.
+
+    Row order is load-bearing: Example node ids are `ex:<source>:<target>:<row_idx>`,
+    so reading the three split CSVs and concatenating them instead would renumber
+    every BigBind Example. We keep activities_all's order and join the split in.
+    """
+    missing = [f for f in _BIGBIND_SPLIT_FILES.values() if not (meta_dir / f).exists()]
+    if missing:
+        log.warning("BigBind: split files absent (%s) — split stays 'unknown'",
+                    ", ".join(missing))
+        return df.with_columns(pl.lit("unknown").alias("split"))
+
+    lut = pl.concat([
+        _read_keys(meta_dir / fname).with_columns(pl.lit(name).alias("split"))
+        for name, fname in _BIGBIND_SPLIT_FILES.items()
+    ], how="vertical")
+    if lut["_rowkey"].n_unique() != lut.height:
+        raise ValueError("BigBind: split files share rows — the split is not a partition")
+
+    keys = _read_keys(csv_path)
+    if keys.height != df.height:
+        raise ValueError(f"BigBind: key rows {keys.height} != data rows {df.height}")
+
+    out = (df.hstack(keys)
+             .with_row_index("_ord")
+             .join(lut, on="_rowkey", how="left")
+             .sort("_ord")
+             .drop("_ord", "_rowkey"))
+    n_missing = int(out["split"].null_count())
+    if n_missing:
+        raise ValueError(
+            f"BigBind: {n_missing} rows of {csv_path.name} are in no split file. "
+            f"The three split CSVs must partition it exactly."
+        )
+    counts = dict(out.group_by("split").len().iter_rows())
+    log.info("BigBind: split assigned from published files — %s", counts)
+    return out
+
 
 def _featurize_batch(smiles: list[str], log: Optional[logging.Logger] = None
                      ) -> tuple[list[Optional[str]], list[Optional[str]], list[Optional[str]], list[bool]]:
@@ -95,6 +165,10 @@ def build(meta_dir: Path,
     )
     log.info("BigBind: %d activity rows", df.height)
 
+    # Before any filtering: the row keys come from the file, so df must still have
+    # exactly the file's rows when we join.
+    df = _assign_split(df, meta_dir, csv_path, log)
+
     log.info("BigBind: re-canonicalizing SMILES via RDKit ...")
     canon, iks, scaffolds, ok_list = _featurize_batch(df["lig_smiles"].to_list(), log=log)
     df = df.with_columns([
@@ -114,7 +188,7 @@ def build(meta_dir: Path,
         pl.col("uniprot").alias("target"),
         pl.when(pl.col("active")).then(1).otherwise(0).cast(pl.Int8).alias("label"),
         pl.when(pl.col("active")).then(pl.lit("active")).otherwise(pl.lit("inactive")).alias("label_type"),
-        pl.lit("unknown").alias("split"),
+        pl.col("split"),   # from BigBind's own train/val/test files — see _assign_split
         pl.col("ex_rec_pdb").alias("ext_id_1"),
         pl.lit(None, dtype=pl.Utf8).alias("ext_id_2"),
     ]).select([

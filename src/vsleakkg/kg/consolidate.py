@@ -83,16 +83,37 @@ CORPUS_TO_CANONICAL_NODE_TYPE: dict[str, str] = {
     "Publication": NodeType.PUBLICATION.value,    # identity: BindingDB-emitted PMID/DOI publications
     "DatasetSource": NodeType.DATASET_SOURCE.value,
     "DecoyProtocol": NodeType.DECOY_PROTOCOL.value,
+    "Split": NodeType.SPLIT.value,            # the corpus's own published split
+    "LabelType": NodeType.LABEL_TYPE.value,   # active / decoy / inactive / random
 }
 
 # Corpus-level node types that are absorbed elsewhere or are pure scaffolding.
+#
+# `LabelType` and `Split` used to be here. Both justifications were false, and both
+# were false in the same way: they named a mechanism that does not exist.
+#
+#   "Split — canonical schema emits partition assignments separately"
+#       It does not. There is no partition-assignment code, no Split/Partition node
+#       type, no scoring.py. 5,025,497 example_in_split edges — one per Example,
+#       100 % coverage — were deleted, taking LIT-PCBA's AVE_unbiased train/
+#       validation split and BayesBind's val/test split with them. AVE debiasing is
+#       the strongest published defence against benchmark bias; "contamination
+#       survives AVE" is the single most valuable experiment this KG can support,
+#       and the canonical graph had thrown away the ability to state it.
+#
+#   "LabelType — static lookup table"
+#       A lookup table is a mapping you can rebuild from nothing. This one carries
+#       the corpus's own assertion about each example, and `label` (0/1) does not
+#       encode it: a DUD-E property-matched decoy, a LIT-PCBA measured inactive,
+#       and a BayesBind random molecule are all `label = 0` and were, in the
+#       canonical graph, indistinguishable. That is the exact distinction this
+#       project exists to interrogate.
+#
+# Both are now kept as facts and placed in NO axis (schema.NON_AXIS_EDGE_TYPES).
 DROPPED_NODES: frozenset[str] = frozenset({
-    "ChEMBLActivity",        # absorbed into Example via label/label_type
+    "ChEMBLActivity",        # absorbed into Example via label + label_type props
     "AffinityType",          # static lookup table
-    "LabelType",             # static lookup table
     "DatabaseRelease",       # version metadata
-    "Split",                 # corpus-level split labels; canonical schema emits
-                             # partition assignments separately
 })
 
 CORPUS_TO_CANONICAL_EDGE_TYPE: dict[str, str] = {
@@ -106,6 +127,9 @@ CORPUS_TO_CANONICAL_EDGE_TYPE: dict[str, str] = {
     "same_inchikey_as": EdgeType.LIGAND_EXACT.value,
     "same_parent_inchikey_as": EdgeType.LIGAND_PARENT_EXACT.value,
     "example_uses_decoy_protocol": EdgeType.SOURCE_DECOY_PROTOCOL.value,
+    # Facts, in no axis. See DROPPED_NODES above and schema.NON_AXIS_EDGE_TYPES.
+    "example_in_split": EdgeType.EXAMPLE_IN_SPLIT.value,
+    "example_has_label_type": EdgeType.EXAMPLE_HAS_LABEL_TYPE.value,
 }
 # BindingDB enrichment edges (bdb_lig -> Publication / Protein / Assay /
 # bdb_rec -> Ligand / Protein) are NOT mapped here: they form 2-hop paths
@@ -114,10 +138,9 @@ CORPUS_TO_CANONICAL_EDGE_TYPE: dict[str, str] = {
 # kg_edges parquet for downstream graph-traversal queries that want the
 # full BindingDB provenance.
 
-DROPPED_EDGES: frozenset[str] = frozenset({
-    "example_in_split",
-    "example_has_label_type",
-})
+# Nothing is dropped any more. Kept as an explicit empty set, with the history, so
+# that adding a name back here is a deliberate act and not a passing convenience.
+DROPPED_EDGES: frozenset[str] = frozenset()
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +202,73 @@ def _map_nodes(nodes: pl.DataFrame) -> tuple[pl.DataFrame, int]:
         pl.col("node_type").replace(CORPUS_TO_CANONICAL_NODE_TYPE).alias("node_type")
     )
     return kept, n_in - kept.height
+
+
+def _enrich_example_props(nodes: pl.DataFrame, edges: pl.DataFrame) -> pl.DataFrame:
+    """Fold `label_type` and `split` into every Example's props.
+
+    Both are already in the graph as edges (Example -> lt:*, Example -> split:*),
+    so this is redundancy, not new information — deliberately. An Example's props
+    already duplicate `label`, `target` and `source` even though example_from_source
+    exists; the one field that mattered most was the one left out. Reading a label
+    type should not require a join, because a step that requires a join is a step
+    that gets skipped.
+
+    Totality is asserted, not hoped for: every Example must come out with both. If a
+    corpus ever ships an Example without a label type, this raises here rather than
+    letting a null propagate into a contamination score.
+    """
+    ex = nodes.filter(pl.col("node_type") == NodeType.EXAMPLE.value)
+    if ex.is_empty():
+        return nodes
+
+    def _attr(edge_type: str, prefix: str, name: str) -> pl.DataFrame:
+        return (edges.filter(pl.col("edge_type") == edge_type)
+                     .select(pl.col("src").alias("node_id"),
+                             pl.col("dst").str.strip_prefix(prefix).alias(name))
+                     .unique(subset=["node_id"]))
+
+    lt = _attr(EdgeType.EXAMPLE_HAS_LABEL_TYPE.value, "lt:", "label_type")
+    sp = _attr(EdgeType.EXAMPLE_IN_SPLIT.value, "split:", "split")
+
+    merged = (ex.select("node_id", "props")
+                .join(lt, on="node_id", how="left")
+                .join(sp, on="node_id", how="left"))
+
+    missing_lt = int(merged["label_type"].null_count())
+    missing_sp = int(merged["split"].null_count())
+    if missing_lt or missing_sp:
+        raise ValueError(
+            f"Example props enrichment incomplete: {missing_lt} without a label_type, "
+            f"{missing_sp} without a split. Every Example must have both — a corpus "
+            f"that ships neither is a corpus whose negatives cannot be interpreted."
+        )
+
+    # The props JSON is extended textually — cheap at 5 M rows, but it assumes props
+    # is a non-empty object. `{}` would splice into `{, "label_type": ...}`: invalid
+    # JSON, and silently so, since nothing downstream re-parses it at write time.
+    n_empty = int(merged.filter(pl.col("props").str.len_chars() < 3).height)
+    if n_empty:
+        raise ValueError(
+            f"{n_empty} Examples have empty props — textual JSON splice would corrupt "
+            f"them. Build the object properly if this ever becomes reachable."
+        )
+
+    # `split:LIT-PCBA:train` -> strip the prefix leaves `LIT-PCBA:train`; keep the
+    # corpus qualifier, because "train" alone is ambiguous across five corpora.
+    enriched = merged.with_columns(
+        pl.concat_str([
+            pl.col("props").str.strip_suffix("}"),
+            pl.lit(', "label_type": "'), pl.col("label_type"),
+            pl.lit('", "split": "'), pl.col("split"), pl.lit('"}'),
+        ]).alias("props")
+    ).select("node_id", "props")
+
+    out = (nodes.join(enriched, on="node_id", how="left", suffix="_new")
+                .with_columns(pl.coalesce(["props_new", "props"]).alias("props"))
+                .drop("props_new"))
+    log.info("Example props enriched with label_type + split (%d Examples)", ex.height)
+    return out
 
 
 def _map_edges(edges: pl.DataFrame) -> tuple[pl.DataFrame, int]:
@@ -1001,6 +1091,10 @@ def consolidate(
             log.info("deduped %d redundant example_has_protein edges (post protein-id collapse)",
                      deduped_p)
             stats.deferred = (stats.deferred or []) + [f"deduped_example_has_protein={deduped_p}"]
+
+    # label_type + split onto Example props. Before degree, after every edge fix:
+    # it reads edges, so it must see the final edge set.
+    nodes = _enrich_example_props(nodes, edges)
 
     # Degree LAST — after every edge-removing step above.
     #

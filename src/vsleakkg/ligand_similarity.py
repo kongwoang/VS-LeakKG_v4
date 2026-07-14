@@ -25,12 +25,24 @@ band where cross-corpus ligand overlap most needed to be seen. The default is no
 0.80 and it matches the declared contract. Lower it if you want more; never raise
 it without changing the contract in `kg/schema.py` and the docs together.
 
-Within the eligible window we use `rdkit.DataStructs.BulkTanimotoSimilarity`
-which is C-vectorized — ~50M comparisons/second per core.
+Within the eligible window the Tanimoto is computed with numpy over a packed
+uint64 bit-matrix: popcount(a & b) / (|a| + |b| - popcount(a & b)), vectorised
+across the whole window by `np.bitwise_count`. Measured 8.7 M comparisons/second
+per core.
+
+This line used to read "`rdkit.DataStructs.BulkTanimotoSimilarity` ... ~50M
+comparisons/second per core". BulkTanimotoSimilarity is indeed C and fast, but it
+returns a Python LIST, and the caller walked that list element by element to find
+the scores above threshold — ~500,000 Python iterations per query, 1.07e12 in
+total. The real rate was 1.33 M/s. A number in a docstring that nobody had measured
+put a 0.80 rebuild at 9.5 hours and made it look like the cost of the threshold
+rather than the cost of the loop.
 
 Parallelism: query ligands are split into chunks; each worker handles its
-chunk against the full sorted target array (read-only memory shared via
-multiprocessing fork). Workers stream rows back; the main process appends to
+chunk against the full sorted target array. The bit-matrix (2 M x 256 B = 515 MB)
+is genuinely shared through fork's copy-on-write — the previous design handed each
+worker 2 M Python BitVect objects, which refcounting writes to, so every worker
+paid its own 5.5 GB. Workers stream rows back; the main process appends to
 the edge buffer in input-order-agnostic fashion (we are emitting symmetric
 edges, so order doesn't matter — but we always emit src < dst lexicographically
 for downstream dedup).
@@ -45,6 +57,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import multiprocessing as mp
 import os
@@ -88,51 +101,79 @@ def _restore_fp(blob: bytes):
     return DataStructs.CreateFromBinaryText(blob)
 
 
+def pack_bitmatrix(fp_blobs: list[bytes]) -> np.ndarray:
+    """Pack RDKit fingerprints into an (N, 32) uint64 bit-matrix.
+
+    2048 bits = 32 uint64 lanes. `np.bitwise_count` (numpy >= 2.0) then gives the
+    intersection popcount of a whole window in one vectorised call.
+    """
+    n = len(fp_blobs)
+    buf = np.zeros((n, 2048), dtype=np.uint8)
+    for i, b in enumerate(fp_blobs):
+        DataStructs.ConvertToNumpyArray(_restore_fp(b), buf[i])
+    return np.packbits(buf, axis=1).view(np.uint64)
+
+
 def _similar_chunk(args: tuple) -> list[tuple[int, int, float]]:
     """Worker: compare a chunk of query indices against the global target arrays.
 
-    Each query Q at sorted index q is compared against targets at indices in
-    `eligible_window(popcount[q])`. We pass the precomputed sorted arrays
-    (popcount, fp blobs, lig_ids) as workers' globals through fork().
+    THE INNER LOOP USED TO BE THE WHOLE COST, AND IT WAS IN PYTHON. It called
+    `BulkTanimotoSimilarity`, which is C and fast, and then walked the returned
+    Python list element by element looking for scores over the threshold:
+
+        sims = DataStructs.BulkTanimotoSimilarity(fps[q], fps[start:hi])
+        for off, s in enumerate(sims):          # up to ~500,000 iterations, PER QUERY
+            if s >= threshold: ...
+
+    At 2 M queries that is 1.07e12 Python loop iterations. The module docstring
+    advertised "~50M comparisons/second per core"; the measured rate was 1.33 M/s —
+    38x slower than claimed, and it put a 0.80 rebuild at 9.5 hours on 24 cores.
+
+    The comparison never needed RDKit. A Tanimoto over two bitsets is
+    popcount(a & b) / (|a| + |b| - popcount(a & b)), and numpy does that over an
+    entire window with no Python in the loop at all. Measured 8.70 M/s per core —
+    6.5x — and verified pair-for-pair identical to the RDKit path (0 pairs differing
+    either way, max |dT| = 0.000000) in tests/test_ligand_similarity.py.
     """
     q_indices, threshold = args
-    # Pull module globals set in `_init_worker` — fps is now a list of
-    # already-restored BitVect objects so the inner loop is comparison-only.
     pc = _WORKER_POPCOUNTS
-    fps = _WORKER_FPS
+    mat = _WORKER_MAT
     pairs: list[tuple[int, int, float]] = []
     for q in q_indices:
-        pq = pc[q]
-        lo_pc = max(1, int(threshold * pq))
-        hi_pc = int(pq / threshold) if threshold > 0 else len(pc)
-        lo = np.searchsorted(pc, lo_pc, side="left")
-        hi = np.searchsorted(pc, hi_pc, side="right")
-        if hi <= q:
-            continue
-        start = max(lo, q + 1)
+        pq = int(pc[q])
+        # Swamidass & Baldi: T(a,b) <= min/max of the popcounts, so a target whose
+        # popcount exceeds pq/threshold cannot reach it. Targets BELOW pq need no
+        # bound — the array is popcount-sorted and we only ever look forward (t > q),
+        # so every target we see already has popcount >= pq.
+        hi = int(np.searchsorted(pc, int(pq / threshold) if threshold > 0 else len(pc),
+                                 side="right"))
+        start = q + 1
         if start >= hi:
             continue
-        # No restoration inside the loop — direct slice into the cached fps.
-        sims = DataStructs.BulkTanimotoSimilarity(fps[q], fps[start:hi])
-        for off, s in enumerate(sims):
-            if s >= threshold:
-                pairs.append((q, start + off, float(s)))
+        inter = np.bitwise_count(mat[q] & mat[start:hi]).sum(axis=1)
+        tan = inter / (pq + pc[start:hi] - inter)
+        for i in np.flatnonzero(tan >= threshold):
+            pairs.append((q, start + int(i), float(tan[i])))
     return pairs
 
 
 _WORKER_POPCOUNTS = None
-_WORKER_FPS = None        # list[BitVect] — pre-restored, NOT raw blobs
+_WORKER_MAT = None        # (N, 32) uint64 bit-matrix — shared read-only via fork
 _WORKER_LIG_IDS = None
 
 
-def _init_worker(pc, fp_blobs, lids):
-    """One-time-per-worker setup: restore every fingerprint blob into a
-    BitVect object. This trades memory (~600 MB per worker for 2 M ligands)
-    for ~50x speedup in the inner loop, which would otherwise call
-    `_restore_fp` once per comparison."""
-    global _WORKER_POPCOUNTS, _WORKER_FPS, _WORKER_LIG_IDS
+def _init_worker(pc, mat, lids):
+    """One-time-per-worker setup.
+
+    This used to rebuild every fingerprint into a BitVect object per worker
+    (`[CreateFromBinaryText(b) for b in fp_blobs]`) — 2 M Python objects that fork's
+    copy-on-write cannot share, because refcounting writes to them. Measured 5.5 GB
+    resident per worker, 24 workers. The bit-matrix is one contiguous numpy array
+    (2 M x 256 B = 515 MB), genuinely shared, and never written to.
+    """
+    global _WORKER_POPCOUNTS, _WORKER_MAT, _WORKER_LIG_IDS
     _WORKER_POPCOUNTS = pc
-    _WORKER_FPS = [DataStructs.CreateFromBinaryText(b) for b in fp_blobs]
+    _WORKER_MAT = mat
     _WORKER_LIG_IDS = lids
 
 
@@ -180,18 +221,23 @@ def compute_ligand_similar_edges(
     n_parsed = sum(1 for b in fp_blobs if b is not None)
     log.info("fingerprints: %d/%d parsed in %.1fs", n_parsed, n, fp_time)
 
-    # 2) Drop unparsed entries and compute popcounts (number of set bits).
+    # 2) Drop unparsed entries, pack into the bit-matrix, and take popcounts from it.
     keep = [i for i, b in enumerate(fp_blobs) if b is not None]
     fp_blobs = [fp_blobs[i] for i in keep]
     lids = [lids[i] for i in keep]
-    popcounts = np.fromiter(
-        (_restore_fp(b).GetNumOnBits() for b in fp_blobs),
-        dtype=np.int32, count=len(fp_blobs))
+    t0 = time.perf_counter()
+    mat = pack_bitmatrix(fp_blobs)
+    del fp_blobs   # 2 M Python bytes objects; the matrix is the only copy we need
+    popcounts = np.bitwise_count(mat).sum(axis=1).astype(np.int32)
+    log.info("packed %d x %d uint64 bit-matrix (%.0f MB) in %.1fs",
+             mat.shape[0], mat.shape[1], mat.nbytes / 1e6, time.perf_counter() - t0)
 
-    # 3) Sort everything by popcount ascending.
+    # 3) Sort everything by popcount ascending. `mat[order]` materialises the sorted
+    #    matrix once, contiguously, so every worker's window slice is a contiguous
+    #    read and fork shares the pages instead of copying them.
     order = np.argsort(popcounts, kind="stable")
     popcounts = popcounts[order]
-    fp_blobs = [fp_blobs[i] for i in order]
+    mat = np.ascontiguousarray(mat[order])
     lids = [lids[i] for i in order]
     log.info("sorted by popcount; range = %d..%d, median = %d",
              int(popcounts.min()), int(popcounts.max()), int(np.median(popcounts)))
@@ -208,7 +254,7 @@ def compute_ligand_similar_edges(
     log_every = max(1, len(q_chunks) // 50)
     with mp.get_context("fork").Pool(
         n_workers, initializer=_init_worker,
-        initargs=(popcounts, fp_blobs, lids)) as pool:
+        initargs=(popcounts, mat, lids)) as pool:
         for chunk_pairs in pool.imap_unordered(_similar_chunk, q_chunks, chunksize=1):
             pairs.extend(chunk_pairs)
             n_chunks_done += 1
@@ -253,6 +299,42 @@ def compute_ligand_similar_edges(
     return edges
 
 
+def ligand_set_fingerprint(nodes_path: Path) -> str:
+    """A hash of the Ligand node-id set — the only input these edges depend on.
+
+    `ligand_similar` edges reference nothing but Ligand node ids, and a Ligand node
+    id is md5(canonical SMILES). So the edges stay valid across ANY rebuild that does
+    not add or remove a ligand — a relabelled split, a new Example prop, a fixed
+    provenance join. This hash is what lets `reattach_ligand_similar.py` prove that,
+    instead of asking a tired human to remember it.
+    """
+    nodes = pl.read_parquet(nodes_path, columns=["node_id", "node_type"])
+    ids = (nodes.filter(pl.col("node_type") == "Ligand")["node_id"]
+                .sort().to_list())
+    h = hashlib.sha256()
+    h.update(str(len(ids)).encode())
+    for i in ids:
+        h.update(i.encode())
+    return h.hexdigest()
+
+
+def persist(edges_dir: Path, new_edges: pl.DataFrame, lig_fingerprint: str) -> Path:
+    """Write the similarity edges as a standalone artefact.
+
+    Two hours of Tanimoto used to live in exactly one place: inside
+    kg_edges.parquet. `build_kg` rewrites that file from scratch, so any rebuild —
+    for a reason having nothing to do with ligands — silently destroyed them, and
+    nothing in the repo said so. Now they are also written here, tagged with the
+    ligand-set hash they were computed against, and can be reattached in seconds.
+    """
+    out = edges_dir / "ligand_similar_edges.parquet"
+    (new_edges.with_columns(pl.lit(lig_fingerprint).alias("_ligand_set_sha256"))
+              .write_parquet(out))
+    log.info("persisted %d similarity edges -> %s (ligand set %s)",
+             new_edges.height, out, lig_fingerprint[:12])
+    return out
+
+
 def append_to_kg(edges_path: Path, new_edges: pl.DataFrame) -> int:
     """Append the new edges to the existing kg_edges parquet (with dedup).
 
@@ -286,6 +368,7 @@ def main() -> int:
     edges = compute_ligand_similar_edges(
         args.kg_nodes, threshold=args.threshold,
         n_workers=args.workers, chunk_size=args.chunk_size)
+    persist(args.kg_edges.parent, edges, ligand_set_fingerprint(args.kg_nodes))
     total = append_to_kg(args.kg_edges, edges)
     log.info("kg_edges.parquet now has %d total edges", total)
     return 0

@@ -532,15 +532,24 @@ def task_chembl_provenance() -> str:
             pl.lit("candidate").alias("confidence"),
         ])
 
+    # `year` and `assay_type` are joined in one statement above and dropped by this
+    # select. That single omission is the whole reason the time axis does not exist:
+    # the schema declares TimeBin, example_has_timebin and time_overlap, weights them
+    # (1.00 and 0.40) and lists them in AXES — and the graph has never held one. The
+    # docs blamed missing data ("trục time rỗng, cần ngày tài liệu ChEMBL"). The data
+    # was never missing: load_chembl_db has always issued `SELECT ... d.year ...`, and
+    # chembl_documents.parquet carries a year for 99.8 % of its 92,121 documents,
+    # 1974-2024. The fact was loaded, joined, and then thrown away one line later.
     benchmark_prov = (mapped.join(enriched, on="molregno", how="left")
                       .select([
                           "benchmark_dataset", "canonical_smiles", "inchikey",
                           "molregno", "molecule_chembl_id",
                           "activity_id", "assay_id", "assay_chembl_id",
-                          "doc_id", "document_chembl_id",
+                          "doc_id", "document_chembl_id", "year",
                           "target_chembl_id",
                           "standard_type", "standard_relation",
                           "standard_value", "standard_units", "pchembl_value",
+                          "assay_type",
                           "provenance_level", "confidence",
                       ]))
     benchmark_prov.write_parquet(PROCESSED / "benchmark_chembl_candidate_provenance.parquet")
@@ -564,19 +573,16 @@ def task_load_bayesbind() -> str:
     """Parse BayesBind per-target actives/random CSVs into per-corpus parquets."""
     if not BAYESBIND_ROOT.exists():
         raise FileNotFoundError(BAYESBIND_ROOT)
-    out_ex  = PROCESSED / "bayesbind_examples.parquet"
-    out_n   = PROCESSED / "bayesbind_nodes.parquet"
-    out_e   = PROCESSED / "bayesbind_edges.parquet"
-    if out_ex.exists() and out_n.exists() and out_e.exists():
-        return (f"cached examples={pl.read_parquet(out_ex).height:,} "
-                f"nodes={pl.read_parquet(out_n).height:,} "
-                f"edges={pl.read_parquet(out_e).height:,}")
+    if (c := _cached("bayesbind")):
+        return c
+    out_ex, out_n, out_e = _cache_outputs("bayesbind")
     examples, nodes, edges = load_bayesbind.build(
         extracted_dir=BAYESBIND_ROOT, log=log,
     )
     examples.write_parquet(out_ex)
     nodes.write_parquet(out_n)
     edges.write_parquet(out_e)
+    write_cache_stamp("bayesbind")
     (REPORTS / "bayesbind_loader_report.md").write_text(
         "# BayesBind loader summary\n\n" + ts() + "\n\n"
         f"- examples: {examples.height:,}\n"
@@ -598,14 +604,9 @@ def task_load_bigbind() -> str:
     """
     if not BIGBIND_META.exists():
         raise FileNotFoundError(BIGBIND_META)
-    out_ex  = PROCESSED / "bigbind_examples.parquet"
-    out_n   = PROCESSED / "bigbind_nodes.parquet"
-    out_e   = PROCESSED / "bigbind_edges.parquet"
-    if out_ex.exists() and out_n.exists() and out_e.exists():
-        return (f"cached examples={pl.read_parquet(out_ex).height:,} "
-                f"nodes={pl.read_parquet(out_n).height:,} "
-                f"edges={pl.read_parquet(out_e).height:,}")
-
+    if (c := _cached("bigbind")):
+        return c
+    out_ex, out_n, out_e = _cache_outputs("bigbind")
     examples, nodes, edges = load_bigbind.build(
         meta_dir=BIGBIND_META,
         extracted_dir=BIGBIND_EXTRACTED if BIGBIND_EXTRACTED.exists() else None,
@@ -614,6 +615,7 @@ def task_load_bigbind() -> str:
     examples.write_parquet(out_ex)
     nodes.write_parquet(out_n)
     edges.write_parquet(out_e)
+    write_cache_stamp("bigbind")
     (REPORTS / "bigbind_loader_report.md").write_text(
         "# BigBind loader summary\n\n" + ts() + "\n\n"
         f"- examples: {examples.height:,}\n"
@@ -671,20 +673,78 @@ def _build_corpus(slug: str, human: str, examples_df: pl.DataFrame,
     df.write_parquet(PROCESSED / f"{slug}_examples.parquet")
     nodes.write_parquet(PROCESSED / f"{slug}_nodes.parquet")
     edges.write_parquet(PROCESSED / f"{slug}_edges.parquet")
+    write_cache_stamp(slug)   # so a later code change invalidates this, not a human
     log.info("%s: %d examples, %d nodes, %d edges",
              human, df.height, nodes.height, edges.height)
     return f"examples={df.height:,} nodes={nodes.height:,} edges={edges.height:,}"
 
 
+# --------------------------------------------------------------------------
+# Corpus cache — keyed on the CODE, not merely on the file existing.
+#
+# The cache used to be `if the three parquets exist, reuse them`. Nothing else. So
+# a fix to a loader did nothing at all until somebody remembered to delete the
+# parquet by hand, and the pipeline reported success either way. Two defects in this
+# project came through that door:
+#
+#   * The BigBind split fix (reading the published train/val/test files instead of
+#     stamping "unknown") was a no-op on its first run. Only a hard assertion on the
+#     expected counts caught it — a warning would have let it pass.
+#   * The shipped KG mixed TWO RDKit versions across corpora: DUD-E/DEKOIS/LIT-PCBA
+#     were rebuilt under 2026.03.2 while BigBind/BayesBind were inherited from v3.
+#     RDKit changed its E/Z bond-direction convention, so ~13,000 Ligand node ids —
+#     which are md5(canonical isomeric SMILES) — moved. The cache had no idea.
+#
+# The fingerprint therefore covers the loader source, the featurisation code that
+# every corpus routes through, AND the RDKit version, because all three determine
+# the bytes in the parquet. Change any of them and the corpus rebuilds itself.
+_CACHE_LOADER: dict[str, str] = {
+    "dude": "load_dude.py",
+    "dekois": "load_dekois.py",
+    "litpcba_ave": "load_litpcba.py",
+    "bigbind": "load_bigbind.py",
+    "bayesbind": "load_bayesbind.py",
+}
+_CACHE_SHARED: tuple[str, ...] = ("chem.py", "build_graph.py")
+
+
+def _code_fingerprint(slug: str) -> str:
+    import rdkit
+    h = hashlib.sha256()
+    h.update(rdkit.__version__.encode())
+    here = Path(__file__).resolve().parent
+    for name in (_CACHE_LOADER[slug],) + _CACHE_SHARED:
+        h.update(name.encode())
+        p = here / name
+        h.update(p.read_bytes() if p.exists() else b"")
+    return h.hexdigest()[:16]
+
+
+def _cache_outputs(slug: str) -> tuple[Path, Path, Path]:
+    return (PROCESSED / f"{slug}_examples.parquet",
+            PROCESSED / f"{slug}_nodes.parquet",
+            PROCESSED / f"{slug}_edges.parquet")
+
+
+def write_cache_stamp(slug: str) -> None:
+    (PROCESSED / f"{slug}_cache.json").write_text(
+        json.dumps({"code": _code_fingerprint(slug)}))
+
+
 def _cached(slug: str) -> str | None:
-    ex = PROCESSED / f"{slug}_examples.parquet"
-    n  = PROCESSED / f"{slug}_nodes.parquet"
-    e  = PROCESSED / f"{slug}_edges.parquet"
-    if ex.exists() and n.exists() and e.exists():
-        return (f"cached examples={pl.read_parquet(ex).height:,} "
-                f"nodes={pl.read_parquet(n).height:,} "
-                f"edges={pl.read_parquet(e).height:,}")
-    return None
+    ex, n, e = _cache_outputs(slug)
+    if not (ex.exists() and n.exists() and e.exists()):
+        return None
+    stamp = PROCESSED / f"{slug}_cache.json"
+    want = _code_fingerprint(slug)
+    got = json.loads(stamp.read_text()).get("code") if stamp.exists() else None
+    if got != want:
+        log.warning("cache for %s is STALE (code %s, now %s) — REBUILDING",
+                    slug, got or "<unstamped>", want)
+        return None
+    return (f"cached examples={pl.read_parquet(ex).height:,} "
+            f"nodes={pl.read_parquet(n).height:,} "
+            f"edges={pl.read_parquet(e).height:,}")
 
 
 def task_load_dude() -> str:
@@ -963,6 +1023,12 @@ def task_build_kg() -> str:
         p_asy = prov_clean["assay_chembl_id"].to_list()
         p_doc = prov_clean["document_chembl_id"].to_list()
         p_tgt = prov_clean["target_chembl_id"].to_list()
+        # The publication year and the assay type. Both were joined into `enriched`
+        # and then dropped by the select above, so every Publication and every Assay
+        # node in the shipped graph carried props `{}` — 92,987 publications with no
+        # date, in a graph whose schema declares a time axis.
+        p_year = prov_clean["year"].to_list()
+        p_atype = prov_clean["assay_type"].to_list()
 
         assays_seen, docs_seen, targets_seen, acts_seen = set(), set(), set(), set()
         for i in range(prov_clean.height):
@@ -986,7 +1052,8 @@ def task_build_kg() -> str:
             if asy_chid:
                 asy_nid = f"chembl_asy:{asy_chid}"
                 if asy_chid not in assays_seen:
-                    nodes_new.append((asy_nid, "ChEMBLAssay", asy_chid, "{}"))
+                    nodes_new.append((asy_nid, "ChEMBLAssay", asy_chid,
+                                      json.dumps({"assay_type": p_atype[i]})))
                     assays_seen.add(asy_chid)
                 edges_new.append((act_nid, asy_nid, "chembl_activity_has_assay", "{}"))
                 doc_chid = p_doc[i]
@@ -997,7 +1064,9 @@ def task_build_kg() -> str:
             if doc_chid:
                 doc_nid = f"chembl_doc:{doc_chid}"
                 if doc_chid not in docs_seen:
-                    nodes_new.append((doc_nid, "ChEMBLDocument", doc_chid, "{}"))
+                    yr = p_year[i]
+                    nodes_new.append((doc_nid, "ChEMBLDocument", doc_chid,
+                                      json.dumps({"year": int(yr) if yr is not None else None})))
                     docs_seen.add(doc_chid)
                 edges_new.append((act_nid, doc_nid, "chembl_activity_has_document", "{}"))
                 edges_new.append((doc_nid, "src:ChEMBL35", "chembl_document_from_source", "{}"))
@@ -1142,14 +1211,28 @@ def task_build_kg() -> str:
     # precisely how a KG with 48,207 `example_has_ligand` edges instead of 5,025,493
     # got written to disk without a single warning.
     #
-    # A node_id without ':' is not a node we can drop, it is proof that the frame in
-    # memory is corrupt. Say so, and die.
-    _bad = nodes.filter(~pl.col("node_id").str.contains(":")).height
-    if _bad:
+    # A node_id without ':' is not a node we can drop, it is proof that something is
+    # wrong upstream. Say so, SHOW IT, and die.
+    #
+    # This message used to assert the cause: "the string buffers were zeroed in memory
+    # (polars). The RUN is bad, not the code; re-run." Both halves were wrong. The
+    # corruption was never polars — it was two `build_kg` processes writing the same
+    # parquet, because `pkill -f` kills the shell and not its Python children. And an
+    # error that names a culprit it has not proven, while refusing to show the data it
+    # is complaining about, sends the next reader off to re-run a build that will fail
+    # again. Print the offending rows. Let the evidence say what happened.
+    _bad = nodes.filter(~pl.col("node_id").str.contains(":"))
+    if _bad.height:
+        with pl.Config(fmt_str_lengths=120, tbl_rows=30):
+            log.error("node_ids with no ':' prefix:\n%s", _bad)
         raise RuntimeError(
-            f"CORRUPTION: {_bad:,} node_ids have no ':' prefix — the string buffers "
-            f"were zeroed in memory (polars). The RUN is bad, not the code; re-run. "
-            f"Do NOT filter these away: dropping them silently deletes their edges too.")
+            f"{_bad.height:,} node_ids have no ':' prefix. Node ids are typed — "
+            f"`lig:`, `ex:`, `chembl_doc:`, ... — so an untyped one means either a "
+            f"node builder forgot its prefix (look at the node_type above: that names "
+            f"the culprit) or the frame is genuinely corrupt (check for concurrent "
+            f"writers with `pgrep -fa vsleakkg` — see docs). Do NOT filter these away: "
+            f"the semi-join below would then silently delete their edges too, and the "
+            f"build would report success.")
 
     edges = pl.concat([base_e, e_df], how="vertical_relaxed").rechunk().unique()
     _bade = edges.filter(pl.col("edge_type").is_null() | (pl.col("edge_type") == "")).height

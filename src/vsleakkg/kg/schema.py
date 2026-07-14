@@ -2,8 +2,19 @@
 
 The weights match proposal.tex Table 2 (the "Default edge types and leakage
 weights" table). Edit DEFAULT_WEIGHTS to change a release-wide default and bump
-the version string in __init__.py. For run-time overrides, pass a dict to
-score_axis() / score_overall() in scoring.py.
+the version string in __init__.py.
+
+These weights are POLICY, and they are the only policy in this package. The graph
+itself stores none of them: no edge carries a weight column, because "how much does
+sharing this node leak" is a question the scorer answers, not a fact the corpora
+state. Consequently DEFAULT_WEIGHTS and AXIS_EDGE_TYPES have exactly one consumer
+today — `tools/audit_kg.py`, which asserts every edge type in the graph declares a
+weight and that no non-axis edge type slipped into an axis.
+
+There is no scoring.py yet. This docstring used to say "pass a dict to score_axis()
+/ score_overall() in scoring.py"; no such module has ever existed. C(x,A) is still
+to be written, and when it is, it MUST scope its traversal to AXIS_EDGE_TYPES —
+see the NON_AXIS_EDGE_TYPES note below for what happens if it does not.
 """
 from __future__ import annotations
 
@@ -29,6 +40,14 @@ class NodeType(str, Enum):
     DECOY_PROTOCOL_CLASS = "DecoyProtocolClass"
     TIMEBIN = "TimeBin"
     TRAINSET = "TrainSet"  # Mode B: model-specific; props["model"] = "<model_id>"
+    # The corpus's OWN published split, and the corpus's OWN label semantics.
+    # Both were dropped by consolidate.py — Split "because the canonical schema
+    # emits partition assignments separately" (it does not; no such code exists)
+    # and LabelType as a "static lookup table". They are not lookup tables: they
+    # are what the benchmark's authors asserted about each example, and a fact
+    # never recorded cannot be recovered downstream.
+    SPLIT = "Split"
+    LABEL_TYPE = "LabelType"
 
 
 class EdgeType(str, Enum):
@@ -40,6 +59,24 @@ class EdgeType(str, Enum):
     EXAMPLE_FROM_SOURCE = "example_from_source"
     EXAMPLE_HAS_TIMEBIN = "example_has_timebin"
     EXAMPLE_IN_TRAINSET = "example_in_trainset"  # Mode B
+    # ---- Facts about the example that are NOT leakage relations. ----
+    # NEITHER of these may ever appear in AXIS_EDGE_TYPES. They are hubs by
+    # construction: `lt:decoy` has degree 1,503,643 and `split:LIT-PCBA:train`
+    # has degree 1,993,736, so an axis-agnostic scorer that walks the full graph
+    # would connect EVERY decoy to EVERY other decoy through `lt:decoy` at weight
+    # 1.00 x 1.00 and report total contamination. That hazard is real, and it is
+    # why these edges were deleted from the canonical graph. Deleting them was the
+    # wrong cure: it destroyed the facts instead of scoping the traversal. Same
+    # precedent as LIGAND_MEASURED_PROTEIN below — in the graph, in no axis.
+    #
+    # EXAMPLE_HAS_LABEL_TYPE is the only thing in the graph that separates the
+    # three kinds of negative, which `label = 0` alone conflates:
+    #   lt:decoy    (1,503,643)  DUD-E + DEKOIS — property-matched, MACHINE-GENERATED
+    #   lt:inactive (2,737,246)  LIT-PCBA + BigBind — EXPERIMENTALLY MEASURED
+    #   lt:random     (250,000)  BayesBind — random molecules, matched to nothing
+    # The decoy-bias claim this project exists to test is not statable without it.
+    EXAMPLE_IN_SPLIT = "example_in_split"
+    EXAMPLE_HAS_LABEL_TYPE = "example_has_label_type"
 
     # identity / similarity edges between content nodes
     LIGAND_EXACT = "ligand_exact"               # same full InChIKey, different SMILES
@@ -107,7 +144,22 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     EdgeType.TIME_OVERLAP.value: 0.40,
     EdgeType.EXAMPLE_IN_TRAINSET.value: 1.00,
     EdgeType.EXAMPLE_HAS_TIMEBIN.value: 1.00,
+    # Binding edges, like the two above: they attach an Example to a fact about
+    # itself. A weight is declared so `audit_kg` can assert that every edge type in
+    # the graph has one; it is NOT an invitation to traverse them. See EdgeType.
+    EdgeType.EXAMPLE_IN_SPLIT.value: 1.00,
+    EdgeType.EXAMPLE_HAS_LABEL_TYPE.value: 1.00,
 }
+
+# Edge types that carry a weight but belong to NO axis. Kept as an explicit list so
+# `audit_kg` can assert the complement — that nothing here leaked into an axis —
+# rather than leaving it to a reader to notice the absence.
+NON_AXIS_EDGE_TYPES: frozenset[str] = frozenset({
+    EdgeType.LIGAND_MEASURED_PROTEIN.value,
+    EdgeType.EXAMPLE_IN_SPLIT.value,
+    EdgeType.EXAMPLE_HAS_LABEL_TYPE.value,
+    EdgeType.EXAMPLE_IN_TRAINSET.value,
+})
 
 
 # Axis subgraphs: each axis is computed on its own subgraph (proposal section 5.5).

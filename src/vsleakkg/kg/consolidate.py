@@ -495,6 +495,8 @@ def _add_protein_exact_edges(
 def _wire_reference_provenance(
     raw_edges: pl.DataFrame,
     canonical_edges: pl.DataFrame,
+    nodes_for_wire: pl.DataFrame,
+    processed: Path,
     log: logging.Logger,
 ) -> pl.DataFrame:
     """Synthesize Example -> Assay / Publication / Protein direct edges by
@@ -602,6 +604,57 @@ def _wire_reference_provenance(
             canonical_edges = pl.concat([canonical_edges, ex_to_asy],
                                         how="vertical_relaxed")
             n_synth_assay += ex_to_asy.height
+
+        # ---- ChEMBL: ligand -> protein it was MEASURED against ----
+        # `ligand_measured_protein` is documented as "real evidence of pretraining
+        # contamination — a ChEMBL/BindingDB-trained model has seen that (ligand,
+        # protein) pair". It was BindingDB-only: 378,427 pairs over 140,457 ligands.
+        # ChEMBL — the corpus these models are actually pretrained on — contributed
+        # NOTHING, because `chembl_activity_has_target` was never mapped to the
+        # canonical schema and `chembl_targets.parquet` never carried an accession.
+        # ChEMBL has 3,436,257 such pairs over 604,978 ligands to give.
+        #
+        # Only pairs whose protein ALREADY has a node are emitted (2,856,882 of them,
+        # over 4,437 proteins). The other 579,375 would need 3,368 new Protein nodes —
+        # and adding proteins changes the MMseqs clustering, which changes the protein
+        # axis's leakage groups. That is a decision about the experiment, not a bug
+        # fix, so it is left open and logged rather than taken silently.
+        acc_f = processed / "chembl_target_accessions.parquet"
+        act_tgt = (raw_edges.filter(
+                pl.col("edge_type") == "chembl_activity_has_target")
+            .select([pl.col("src").alias("chembl_act_id"),
+                     pl.col("dst").alias("chembl_tgt_id")])
+            .unique())
+        if act_tgt.height and acc_f.exists():
+            acc = (pl.read_parquet(acc_f)
+                     .select((pl.lit("chembl_tgt:") + pl.col("target_chembl_id"))
+                             .alias("chembl_tgt_id"),
+                             (pl.lit("protein:") + pl.col("accession")).alias("dst"))
+                     .unique())
+            lig_to_prot_chembl = (
+                bench_to_chembl
+                .join(chembl_lig_to_act, on="chembl_lid", how="inner")
+                .join(act_tgt, on="chembl_act_id", how="inner")
+                .select(["bench_lid", "chembl_tgt_id"]).unique()
+                .join(acc, on="chembl_tgt_id", how="inner")
+                .select([pl.col("bench_lid").alias("src"), "dst"]).unique())
+            n_all = lig_to_prot_chembl.height
+            prot_ids = nodes_for_wire.filter(
+                pl.col("node_type") == NodeType.PROTEIN.value).select("node_id")
+            lig_to_prot_chembl = lig_to_prot_chembl.join(
+                prot_ids.rename({"node_id": "dst"}), on="dst", how="semi")
+            log.info("  chembl: %d (ligand, protein) measured pairs, %d kept "
+                     "(%d dropped — protein has no node yet)",
+                     n_all, lig_to_prot_chembl.height,
+                     n_all - lig_to_prot_chembl.height)
+            if lig_to_prot_chembl.height:
+                lig_to_prot_chembl = lig_to_prot_chembl.with_columns([
+                    pl.lit(EdgeType.LIGAND_MEASURED_PROTEIN.value).alias("edge_type"),
+                    pl.lit(_json.dumps({"source": "ChEMBL"})).alias("props"),
+                ])
+                canonical_edges = pl.concat([canonical_edges, lig_to_prot_chembl],
+                                            how="vertical_relaxed")
+                n_synth_prot += lig_to_prot_chembl.height
 
     # ---- BindingDB chain ----
     bench_to_bdb = (raw_edges.filter(
@@ -816,7 +869,7 @@ def consolidate(
     # ids that survived `_map_nodes`, so they don't dangle by construction
     # and we skip a second prune pass.
     n_before_wire = edges.height
-    edges = _wire_reference_provenance(raw_edges_full, edges, log)
+    edges = _wire_reference_provenance(raw_edges_full, edges, nodes, processed, log)
     log.info("after wire: n_edges=%d (+%d new)", edges.height, edges.height - n_before_wire)
 
 
@@ -893,6 +946,31 @@ def consolidate(
         if deduped:
             log.info("deduped %d redundant ligand_similar edges (incl. bidir)", deduped)
             stats.deferred = (stats.deferred or []) + [f"deduped_ligand_similar={deduped}"]
+
+    #   - `ligand_measured_protein`: a (ligand, protein) pair can be measured in BOTH
+    #     ChEMBL and BindingDB, and each chain emits it. That is one fact, not two.
+    #     Record both provenances in props rather than shipping a duplicate triple.
+    lmp = edges.filter(pl.col("edge_type") == "ligand_measured_protein")
+    if lmp.height:
+        n_before_m = lmp.height
+        lmp = (lmp.with_columns(
+                   pl.col("props").str.json_path_match("$.source").alias("_s"))
+                  .group_by("src", "dst")
+                  .agg(pl.col("_s").drop_nulls().unique().sort().alias("_srcs"))
+                  .with_columns(
+                      pl.lit(EdgeType.LIGAND_MEASURED_PROTEIN.value).alias("edge_type"),
+                      pl.col("_srcs").list.join("+").alias("_j"))
+                  .with_columns(
+                      (pl.lit('{"source": "') + pl.col("_j") + pl.lit('"}')).alias("props"))
+                  .select("src", "dst", "edge_type", "props"))
+        deduped_m = n_before_m - lmp.height
+        edges = pl.concat([
+            edges.filter(pl.col("edge_type") != "ligand_measured_protein"),
+            lmp,
+        ], how="vertical_relaxed")
+        if deduped_m:
+            log.info("merged %d ligand_measured_protein edges measured in both sources",
+                     deduped_m)
 
     ehp = edges.filter(pl.col("edge_type") == "example_has_protein")
     if ehp.height:

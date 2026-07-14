@@ -151,7 +151,28 @@ dude_fa = tmp / "dude.fasta"
 
 
 def grab(code: str):
+    """receptor.pdb của DUD-E — dùng bản đã lưu, chỉ tải khi chưa có, và LƯU LẠI.
+
+    Trước đây hàm này tải từ `dude.docking.org` mỗi lần chạy và **không lưu gì cả**.
+    Nghĩa là toàn bộ trục protein — 102 target DUD-E, và qua đó `protein_id_map`, các
+    cụm MMseqs, `protein_exact` — treo vào việc một website bên ngoài còn sống. Website
+    đó chết, hoặc đổi đường dẫn, hoặc chặn IP của VUW: KG không dựng lại được, và không
+    có thông báo nào ngoài "tải + rút chuỗi được 0/102 receptor".
+
+    Với một bài báo thì đó không phải rủi ro vận hành, đó là lỗ hổng tái lập. Lưu file
+    xuống `data/raw/DUD-E/<code>/receptor.pdb` — cùng chỗ với `actives_final.ism` —
+    để lần chạy sau không cần mạng.
+    """
+    local = RAW / "DUD-E" / code / "receptor.pdb"
+    if local.is_file() and local.stat().st_size > 0:
+        return code, ca_seq(local.read_text(errors="ignore"))
     t = fetch(f"https://dude.docking.org/targets/{code}/receptor.pdb")
+    if t and "ATOM" in t:
+        try:
+            local.parent.mkdir(parents=True, exist_ok=True)
+            local.write_text(t)
+        except OSError as ex:
+            print(f"    ! không lưu được {local}: {ex}")
     return code, (ca_seq(t) if t else "")
 
 
@@ -243,15 +264,36 @@ for t in dk_targets:
 
 
 def rcsb(pdb: str) -> list[str]:
-    accs = []
-    for ent in range(1, 5):
+    """Mọi polymer entity của một cấu trúc — đọc thật, không phải đọc 4 cái đầu.
+
+    Bản cũ chạy `range(1, 5)` và `break` ngay khi một lần fetch hỏng. Hai hệ quả:
+    một cấu trúc có 5+ chuỗi thì bị bỏ sót phần đuôi, và một lỗi mạng thoáng qua ở
+    entity 1 làm mất TOÀN BỘ cấu trúc đó trong im lặng. Trong khi chính docstring của
+    file này viết "đọc MỌI polymer entity" — và đó là lý do LIT-PCBA `MTORC1` từng ra
+    FKBP1A: đọc nhầm đối tác đồng kết tinh vì chỉ nhìn entity đầu tiên.
+
+    Hỏi RCSB xem cấu trúc có bao nhiêu entity, rồi đọc hết. Một entity lỗi thì bỏ qua
+    entity đó, không bỏ cả cấu trúc.
+    """
+    accs: list[str] = []
+    n_ent = 12  # trần an toàn nếu không hỏi được số thật
+    j = fetch(f"https://data.rcsb.org/rest/v1/core/entry/{pdb}")
+    if j:
+        try:
+            ids = (json.loads(j).get("rcsb_entry_container_identifiers", {})
+                                .get("polymer_entity_ids") or [])
+            if ids:
+                n_ent = len(ids)
+        except Exception:
+            pass
+    for ent in range(1, n_ent + 1):
         j = fetch(f"https://data.rcsb.org/rest/v1/core/polymer_entity/{pdb}/{ent}")
         if not j:
-            break
+            continue          # entity này hỏng — bỏ qua nó, KHÔNG bỏ cả cấu trúc
         try:
             d = json.loads(j)
         except Exception:
-            break
+            continue
         ids = (d.get("rcsb_polymer_entity_container_identifiers", {})
                 .get("reference_sequence_identifiers") or [])
         accs += [i["database_accession"] for i in ids if i.get("database_name") == "UniProt"]

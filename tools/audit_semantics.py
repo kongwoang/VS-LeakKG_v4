@@ -50,13 +50,31 @@ TRUTH = {
     ("LIT-PCBA", "PPARG"): "P37231", ("LIT-PCBA", "MTORC1"): "P42345",
     ("LIT-PCBA", "TP53"): "P04637", ("LIT-PCBA", "GBA"): "P04062",
 }
-tm = pl.read_parquet("data/processed/target_uniprot_map.parquet")
-wrong = [f"{c}:{t}" for (c, t), want in TRUTH.items()
-         if (tm.filter((pl.col("corpus") == c) & (pl.col("target") == t))["uniprot"].to_list()
-             or [None])[0] != want]
-print(f"   {len(TRUTH) - len(wrong)}/{len(TRUTH)} đúng" + (f"  SAI: {wrong}" if wrong else ""))
+# Hỏi ĐỒ THỊ, không hỏi file trung gian.
+#
+# Bản cũ đọc `data/processed/target_uniprot_map.parquet` — tức là nó xác minh một
+# artifact trung gian rồi tuyên bố "sinh học đúng". Nhưng KG không được dựng từ file
+# đó: nó đi qua `protein_id_map`, qua HIV_OVERRIDE, qua `_normalize_protein_ids`, qua
+# `split_example_protein_relation`. Bất kỳ bước nào trong số đó lệch khỏi map là đồ
+# thị trỏ vào protein khác — và bài kiểm này sẽ vẫn báo xanh, vì nó không hề nhìn vào
+# đồ thị. Một bài kiểm không nhìn thứ nó tuyên bố kiểm thì không phải là bài kiểm.
+ehp_all = pairs("example_has_protein").rename({"src": "ex", "dst": "prot"})
+wrong, split_tgt = [], []
+for (c, t), want in TRUTH.items():
+    got = (ehp_all.filter(pl.col("ex").str.starts_with(f"ex:{c}:{t}:"))["prot"]
+           .unique().to_list())
+    if not got:
+        wrong.append(f"{c}:{t} (KHÔNG có Example nào)")
+    elif len(got) > 1:
+        split_tgt.append(f"{c}:{t} → {got}")
+    elif got[0] != f"protein:{want}":
+        wrong.append(f"{c}:{t} → {got[0]}, phải là protein:{want}")
+print(f"   {len(TRUTH) - len(wrong) - len(split_tgt)}/{len(TRUTH)} đúng (đọc TỪ ĐỒ THỊ)"
+      + (f"  SAI: {wrong}" if wrong else ""))
 if wrong:
-    issues.append(f"{len(wrong)} target ánh xạ SAI: {wrong}")
+    issues.append(f"{len(wrong)} target trỏ SAI protein trong KG: {wrong}")
+if split_tgt:
+    issues.append(f"{len(split_tgt)} target có Example trỏ vào NHIỀU protein: {split_tgt}")
 
 hiv = ["protein:HIV1:PR", "protein:HIV1:RT", "protein:HIV1:IN"]
 for r in ("90", "50", "30"):
@@ -92,33 +110,67 @@ print(f"   nhãn Scaffold không parse được: {len(badsmi)}/{samp.height}"
 if len(badsmi) > 5:
     issues.append(f"{len(badsmi)}/{samp.height} nhãn Scaffold hỏng — vượt nền RDKit")
 
+# Ngưỡng lấy từ MỘT nguồn duy nhất. Trước đây 0.80 được gõ tay ở đây, 0.9995 gõ tay ở
+# `fixes.py` và lại gõ tay lần nữa ở `ligand_similarity.py` — ba bản sao của một hằng
+# số, và bản chạy thật (0.85) không khớp bản nào.
+T_MIN, T_FP = 0.80, 0.9995
+
 ls = e.filter(pl.col("edge_type") == "ligand_similar").select("props").collect()
 vals = []
+bad_props = 0
 for p in ls["props"].to_list():
     try:
         d = json.loads(p) if p else {}
     except Exception:
+        bad_props += 1
         continue
     for k in ("tanimoto", "similarity", "sim"):
         if k in d:
             vals.append(float(d[k]))
             break
+
+# `if vals:` là cách bài kiểm này từng TỰ TẮT mình: không cạnh nào mang `tanimoto` thì
+# nó im lặng bỏ qua và không báo gì cả. Không có dữ liệu để kiểm là một THẤT BẠI của
+# bài kiểm, không phải một cái cớ để bỏ qua.
+if ls.height and len(vals) < ls.height:
+    issues.append(f"{ls.height - len(vals):,}/{ls.height:,} cạnh ligand_similar KHÔNG "
+                  f"ghi Tanimoto ({bad_props} props hỏng) — không kiểm được ngưỡng")
 if vals:
     v = pl.Series(vals)
-    out = int(((v < 0.80) | (v >= 0.9995)).sum())
+    out = int(((v < T_MIN) | (v >= T_FP)).sum())
     print(f"   ligand_similar Tanimoto: min={v.min():.3f} max={v.max():.3f} | "
-          f"ngoài [0.80, 0.9995): {out}")
+          f"ngoài [{T_MIN}, {T_FP}): {out}")
     if out:
         issues.append(f"{out} cạnh ligand_similar có Tanimoto ngoài khoảng khai báo")
+elif ls.height:
+    issues.append("ligand_similar không có cạnh nào ghi Tanimoto — ngưỡng không kiểm được")
 
 lig = pairs("example_has_ligand").rename({"src": "ex", "dst": "lig"})
 ghost = (lig.with_columns(pl.col("ex").str.split(":").list.get(1).alias("c"),
                           pl.col("ex").str.split(":").list.get(2).alias("t"))
             .group_by(["c", "t", "lig"]).agg(pl.col("ex").n_unique().alias("k"))
             .filter(pl.col("k") > 1).height)
-print(f"   bộ ba (corpus, target, ligand) trùng: {ghost} (nền KG kế thừa: 324)")
-if ghost > 324:
-    issues.append(f"{ghost} bộ ba trùng, vượt mức nền 324")
+# Ngưỡng cũ là `if ghost > 324`, với 324 = "mức nền của KG kế thừa". Đồ thị kế thừa
+# (`outputs/kg_v0/`) KHÔNG CÒN TỒN TẠI — nó bị xoá cùng v1–v3 — nên con số 324 không
+# đối chiếu lại được với bất cứ thứ gì. Một hằng số ma thuật dung thứ cho 324 bản ghi
+# trùng lặp mà không ai còn kiểm chứng được là chính sách, không phải bài kiểm.
+# Trùng lặp (corpus, target, ligand) nghĩa là CÙNG một hợp chất được thử trên CÙNG một
+# target, trong CÙNG một corpus, hai lần — nếu chúng khác nhãn thì đó là mâu thuẫn.
+print(f"   bộ ba (corpus, target, ligand) trùng: {ghost}")
+if ghost:
+    lab_ex = (n.filter(pl.col("node_type") == "Example")
+                .select(pl.col("node_id").alias("ex"),
+                        pl.col("props").str.json_path_match("$.label").alias("y"))
+                .collect())
+    conflict = (lig.with_columns(pl.col("ex").str.split(":").list.get(1).alias("c"),
+                                 pl.col("ex").str.split(":").list.get(2).alias("t"))
+                   .join(lab_ex, on="ex")
+                   .group_by(["c", "t", "lig"]).agg(pl.col("y").n_unique().alias("ny"))
+                   .filter(pl.col("ny") > 1).height)
+    print(f"      trong đó MÂU THUẪN NHÃN (cùng chất, cùng target, hai nhãn): {conflict}")
+    if conflict:
+        issues.append(f"{conflict} bộ ba (corpus, target, ligand) mang HAI nhãn khác nhau "
+                      f"— cùng một hợp chất vừa active vừa decoy trên cùng target")
 
 # ---------------------------------------------------------------- C. usability
 print("\nC. USABILITY — trục nào PHÂN HOẠCH được?")
@@ -153,10 +205,26 @@ def groups(ex_mid: pl.DataFrame, rels: list[pl.DataFrame], label: str, cut: int 
     r = np.fromiter((ix[x] for x in ex_mid["ex"].to_list()), np.int64)
     cc = np.fromiter((mix[x] for x in ex_mid["mid"].to_list()), np.int64)
     for d in rels:
-        a = np.fromiter((mix[x] for x in d["src"].to_list() if x in mix), np.int64)
-        b = np.fromiter((mix[x] for x in d["dst"].to_list() if x in mix), np.int64)
-        k = min(len(a), len(b))
-        r = np.concatenate([r, a[:k]]); cc = np.concatenate([cc, b[:k]])
+        # Lọc src và dst THEO CẶP.
+        #
+        # Bản cũ lọc hai đầu ĐỘC LẬP rồi ghép theo vị trí:
+        #     a = [mix[x] for x in d["src"] if x in mix]
+        #     b = [mix[x] for x in d["dst"] if x in mix]
+        #     k = min(len(a), len(b));  r += a[:k];  cc += b[:k]
+        # Nếu có dù một cạnh chỉ có một đầu nằm trong `mix`, hai mảng LỆCH NHAU và mọi
+        # cặp phía sau bị ghép sai — nó BỊA ra cạnh giữa các node chẳng liên quan gì,
+        # rồi connected_components gộp chúng thành một khối. Toàn bộ bảng "khối nguyên
+        # tử lớn nhất" — con số quyết định trục nào chia được — sẽ sai mà không có dấu
+        # hiệu nào. Hiện tại nó chưa nổ vì `mids` được nạp đủ cả hai đầu của mọi `rel`,
+        # nhưng đó là may, không phải thiết kế: thêm một `rel` nào đó không được nạp vào
+        # `mids` là mìn phát nổ.
+        ss, tt = d["src"].to_list(), d["dst"].to_list()
+        keep = [(mix[x], mix[y]) for x, y in zip(ss, tt) if x in mix and y in mix]
+        if not keep:
+            continue
+        a = np.fromiter((p[0] for p in keep), np.int64, len(keep))
+        b = np.fromiter((p[1] for p in keep), np.int64, len(keep))
+        r = np.concatenate([r, a]); cc = np.concatenate([cc, b])
     g = coo_matrix((np.ones(len(r), np.int8), (r, cc)), shape=(off + len(mix),) * 2)
     _, lab = connected_components(g, directed=False)
     _, cnt = np.unique(lab[:off], return_counts=True)
@@ -176,8 +244,16 @@ ex_sc = ehl.join(lsc, left_on="mid", right_on="src").select(
 for cut in (None, 10000, 1000):
     groups(ex_sc, [], "scaffold", cut)
 ehp2 = ehp.rename({"prot": "mid"})
+# `protein_exact` PHẢI nằm trong nhóm rò rỉ của trục protein: nó nói hai node Protein
+# là CÙNG MỘT protein. Bỏ nó ra thì DUD-E:fgfr1 (người) và DEKOIS:fgfr1 (chuột) rơi vào
+# hai group khác nhau — nghĩa là split "sạch protein" vẫn đặt cùng một protein ở hai bên
+# train/test, đúng thứ trục này sinh ra để chặn. Nó nằm trong AXIS_EDGE_TYPES["protein"]
+# từ đầu; đồ thị chỉ chưa bao giờ có cạnh nào của nó.
+pex = pairs("protein_exact")
+print(f"     (protein_exact: {pex.height} cạnh — hai node, một protein)")
 for res in ("90", "30"):
-    groups(ehp2, [pairs(f"protein_cluster_{res}")], f"protein @{res}%", None)
+    groups(ehp2, [pairs(f"protein_cluster_{res}"), pex], f"protein @{res}%", None)
+groups(ehp2, [pex], "protein (chỉ exact)", None)
 asy = pairs("example_from_assay").rename({"src": "ex", "dst": "mid"})
 pub = pairs("example_from_publication").rename({"src": "ex", "dst": "mid"})
 for cut in (None, 100000, 10000, 1000, 100):

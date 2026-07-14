@@ -220,6 +220,24 @@ def validate_raw_kg(nodes: pl.DataFrame, edges: pl.DataFrame,
             f"Example nodes: {n_ex:,}, expected exactly {expected_examples:,} "
             f"({n_ex - expected_examples:+,})")
 
+    # Every benchmark Ligand that the map resolves to a ChEMBL compound must actually
+    # CARRY the link edge — that edge is the only route by which an Example reaches an
+    # Assay or a Publication. A dedup keyed on molregno instead of on the pair silently
+    # dropped 2,809 of them, and with them the entire provenance of 8,811 Examples.
+    # Nothing failed; the edges simply were not there.
+    f = PROCESSED / "benchmark_to_chembl_ligand_map.parquet"
+    if f.exists():
+        want = (pl.read_parquet(f, columns=["canonical_smiles", "molregno"])
+                  .filter(pl.col("molregno").is_not_null())["canonical_smiles"].n_unique())
+        got = edges.filter(
+            pl.col("edge_type") == "benchmark_ligand_same_inchikey_as_chembl_ligand"
+        )["src"].n_unique()
+        if got != want:
+            problems.append(
+                f"benchmark->ChEMBL link: {got:,} Ligands carry the edge, but the map "
+                f"resolves {want:,} ({got - want:+,}). Those Ligands' Examples reach no "
+                f"Assay and no Publication.")
+
     if problems:
         raise RuntimeError(
             "raw KG failed write-time validation — REFUSING to write.\n  "
@@ -249,12 +267,28 @@ def task_load_chembl() -> str:
     out_doc = PROCESSED / "chembl_documents.parquet"
     out_asy = PROCESSED / "chembl_assays.parquet"
 
+    out_acc = PROCESSED / "chembl_target_accessions.parquet"
+
     conn = load_chembl_db.connect(CHEMBL_DB)
     if not out_lig.exists():
         log.info("ChEMBL: loading ligands ...")
         load_chembl_db.load_ligands(conn).write_parquet(out_lig)
     if not out_tgt.exists():
         load_chembl_db.load_targets(conn).write_parquet(out_tgt)
+    if not out_acc.exists():
+        # ChEMBL target -> UniProt accession. `load_target_sequences` has always
+        # returned this and nothing ever used it, so the KG had no way to turn
+        # "activity measured against ChEMBL target CHEMBL204" into "this ligand was
+        # measured against protein P00734". Consequence: `ligand_measured_protein` —
+        # documented as "a ChEMBL/BindingDB-trained model has seen this (ligand,
+        # protein) pair" — was BindingDB-only. BindingDB contributed 378,427 pairs
+        # over 140,457 ligands; ChEMBL, the dominant pretraining corpus, contributed
+        # ZERO, and had 3,436,257 pairs over 604,978 ligands to give.
+        log.info("ChEMBL: extracting target -> UniProt accession map ...")
+        (load_chembl_db.load_target_sequences(conn)
+            .select("target_chembl_id", "accession")
+            .drop_nulls().unique()
+            .write_parquet(out_acc))
     if not out_doc.exists():
         load_chembl_db.load_documents(conn).write_parquet(out_doc)
     if not out_asy.exists():
@@ -858,10 +892,28 @@ def task_build_kg() -> str:
     prov_path = PROCESSED / "benchmark_chembl_candidate_provenance.parquet"
     prov = pl.read_parquet(prov_path) if prov_path.exists() else pl.DataFrame()
 
+    # unique(subset=["molregno"]) — one row per ChEMBL compound — was wrong, and it
+    # was wrong in the direction that loses facts.
+    #
+    # The loop below emits TWO things per row: a ChEMBLLigand node (keyed on the ChEMBL
+    # id, so deduping it is harmless — the node dedup handles that anyway) and the edge
+    # `benchmark_ligand_same_inchikey_as_chembl_ligand`, which is keyed on the BENCHMARK
+    # ligand. Two benchmark ligands can share one molregno: same compound, different
+    # canonical SMILES (a tautomer or stereo variant — exactly the pairs `ligand_exact`
+    # exists to bridge). Deduping on molregno kept one of them and silently dropped the
+    # edge for the other, and that edge is the ONLY route by which an Example reaches
+    # ChEMBL: no link, no `example_from_assay`, no `example_from_publication`.
+    #
+    # Measured on the shipped KG: 611,471 benchmark SMILES map onto 608,662 molregnos,
+    # so 2,809 benchmark ligands never got the edge — 25,318 Examples ride on them and
+    # 8,811 of those carry no assay edge at all. They are not missing provenance; the
+    # provenance was thrown away.
+    #
+    # Key on the pair, which is what the edge is.
     mapped_mol = (mp_ok.join(chembl_lig.select(["molregno", "molecule_chembl_id",
                                                   "canonical_smiles", "standard_inchi_key"]),
                               on="molregno", how="left")
-                  .unique(subset=["molregno"]))
+                  .unique(subset=["molregno", "canonical_smiles"]))
     # Pull columns to Python lists before the loop. iter_rows(named=True) over
     # large polars DataFrames (>5M rows in the chembl_provenance case) corrupts
     # strings — f-string interpolation returns null-byte-filled strings of the
@@ -962,7 +1014,14 @@ def task_build_kg() -> str:
     # (UniProt) provenance into the KG. This expands the audit "did model X
     # train on this protein?" signal beyond the ChEMBL-only path.)
     mp_bdb = pl.read_parquet(PROCESSED / "benchmark_to_bindingdb_ligand_map.parquet")
-    mapped_bdb = mp_bdb.filter(pl.col("match_method") != "unmatched").unique(subset=["inchikey", "benchmark_dataset"])
+    # Same defect as the ChEMBL side above, same shape. The edge emitted below is
+    # (benchmark Ligand -> bdb_lig:<inchikey>), and the benchmark Ligand id is
+    # md5(canonical_smiles) — the dataset does not appear in it. Deduping on
+    # (inchikey, benchmark_dataset) therefore keeps ONE canonical_smiles per
+    # (compound, corpus) and drops the BindingDB link for every other SMILES of the
+    # same compound. Key the dedup on what the edge is actually keyed on.
+    mapped_bdb = (mp_bdb.filter(pl.col("match_method") != "unmatched")
+                        .unique(subset=["canonical_smiles", "inchikey"]))
     bdb_lig = pl.read_parquet(PROCESSED / "bindingdb_ligands_minimal.parquet")
     bdb_lig_ik = bdb_lig.unique(subset=["ligand_inchikey"])
     mapped_with_bdb = mapped_bdb.join(bdb_lig_ik.rename({"ligand_inchikey": "inchikey"}),

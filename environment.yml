@@ -28,7 +28,10 @@ dependencies:
   - python=3.12
   - rdkit=2026.03.2        # determines Ligand/Scaffold node ids — see above
   - polars=1.40.1
-  - openbabel
+  # - openbabel            # REMOVED: forces icu <78, which cannot co-solve with
+  #                        # rdkit=2026.03.2 (needs icu >=78.2). The KG pipeline does
+  #                        # not import openbabel; rdkit is the pin that cannot move.
+  #                        # Re-add in a separate env if a downstream tool needs it.
   - pandas
   - duckdb
   - pyarrow

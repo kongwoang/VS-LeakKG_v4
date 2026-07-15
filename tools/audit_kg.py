@@ -41,7 +41,17 @@ ENDPOINTS = {
     # Facts about the example, in no axis (schema.NON_AXIS_EDGE_TYPES).
     "example_in_split":         ("Example", "Split"),
     "example_has_label_type":   ("Example", "LabelType"),
+    # Time axis: which year(s) an Example is attested in.
+    "example_has_timebin":      ("Example", "TimeBin"),
 }
+
+# Relations the schema declares but the KG deliberately does NOT store, because they
+# are downstream POLICY rather than facts — the same status DEFAULT_WEIGHTS has.
+# `time_overlap` encodes "how many years apart counts as leakage", a window choice;
+# the KG records `example_has_timebin` (the year each Example is attested in) and lets
+# downstream compute overlap at whatever window it wants. Flagged, never silently
+# empty: an axis carried only by a deferred relation would still be a hole.
+POLICY_DEFERRED_EDGES = frozenset({"time_overlap"})
 PAIR_TYPES = ["ligand_exact", "ligand_parent_exact",
               "ligand_fingerprint_exact", "ligand_similar", "protein_exact"]
 
@@ -249,11 +259,27 @@ def facts(n: pl.LazyFrame, e: pl.LazyFrame, *, sample: int) -> None:
                .select("label", pl.col("props").str.json_path_match("$.n_heavy_atoms")
                        .cast(pl.Int64).alias("rec")).collect())
         s = sc if sc.height <= sample else sc.sample(n=sample, seed=7)
+
+        def _true_heavy(lbl: str) -> int:
+            # Mirror consolidate._n_heavy EXACTLY, or this check flags its own
+            # disagreement as a data defect. Two cases the naive
+            # `MolFromSmiles(lbl) or -1` gets wrong: the empty Murcko scaffold
+            # (fully-aliphatic ligand) is correctly 0, not -1; and aromatic-carbanion
+            # artefacts that fail the sanitiser still have a well-defined atom count,
+            # recovered by an unsanitised parse.
+            if not lbl:
+                return 0
+            m = Chem.MolFromSmiles(lbl)
+            if m is not None:
+                return m.GetNumHeavyAtoms()
+            m = Chem.MolFromSmiles(lbl, sanitize=False)
+            if m is not None:
+                return m.GetNumHeavyAtoms()
+            return -1
+
         wrong = 0
         for lbl, rec in s.iter_rows():
-            m = Chem.MolFromSmiles(lbl) if lbl else None
-            true = m.GetNumHeavyAtoms() if m is not None else -1
-            if rec != true:
+            if rec != _true_heavy(lbl):
                 wrong += 1
         check(wrong == 0, "Scaffold props.n_heavy_atoms equals RDKit's heavy-atom count",
               f"{wrong:,}/{s.height:,} wrong ({100*wrong/max(1, s.height):.1f} %)")
@@ -298,6 +324,13 @@ def facts(n: pl.LazyFrame, e: pl.LazyFrame, *, sample: int) -> None:
     for axis in sorted(schema.AXIS_EDGE_TYPES):
         for et in sorted(set(schema.AXIS_EDGE_TYPES[axis])):
             k = e.filter(pl.col("edge_type") == et).select(pl.len()).collect().item()
+            if et in POLICY_DEFERRED_EDGES:
+                # Not a hole: an intentional downstream-policy relation. Print it so
+                # the deliberate emptiness is visible, but do not fail on it. The axis
+                # is still real — it is carried by its fact relation (example_has_timebin).
+                print(f"  [DEFER] [{axis}] `{et}` not stored by design (downstream "
+                      f"window policy) — {k:,} edges")
+                continue
             check(k > 0, f"[{axis}] axis relation `{et}` is populated", f"{k:,} edges")
 
     # 10. protein_exact must NOT swallow the HIV domain split: the 99-aa protease is

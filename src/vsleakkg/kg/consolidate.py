@@ -395,12 +395,22 @@ def _drop_trivial_scaffolds(
         if not smi:
             return 0
         m = _Chem.MolFromSmiles(smi)
-        if m is None:
-            # A handful of RDKit Murcko artefacts (aromatic carbanions like [c-])
-            # do not round-trip. Record -1 rather than a plausible-looking lie:
-            # a downstream filter can see "unknown" but cannot see a wrong number.
-            return -1
-        return m.GetNumHeavyAtoms()
+        if m is not None:
+            return m.GetNumHeavyAtoms()
+        # A handful of RDKit Murcko artefacts (aromatic carbanions like [c-]) do not
+        # round-trip through the sanitiser. The heavy-atom count is still a
+        # well-defined fact about the scaffold graph, and it IS recoverable: an
+        # unsanitised parse builds the atom graph without the valence/aromaticity
+        # checks that reject these SMILES, and GetNumHeavyAtoms just counts non-H
+        # atoms. Recover it rather than discard it — "the KG records facts, and a
+        # fact never recorded cannot be recovered downstream". (Measured: this turns
+        # all 37 unparseable scaffolds from -1 into their true counts, e.g.
+        # O=c1[c-]nc(-c2ccccc2)o1 -> 12.) Only a SMILES that even sanitize=False
+        # cannot build stays -1 ("unknown"), which no longer occurs in practice.
+        m = _Chem.MolFromSmiles(smi, sanitize=False)
+        if m is not None:
+            return m.GetNumHeavyAtoms()
+        return -1
 
     def _with_size(row: dict) -> str:
         try:
@@ -580,6 +590,84 @@ def _add_protein_exact_edges(
     log.info("protein_exact: %d edges (%d pairs dropped — endpoint not a Protein node)",
              new.height, pe.height - new.height)
     return pl.concat([edges, new], how="vertical_relaxed")
+
+
+def _add_time_axis(
+    nodes: pl.DataFrame,
+    edges: pl.DataFrame,
+    log: logging.Logger,
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Build the time axis as FACTS only: one TimeBin node per calendar year, and
+    one example_has_timebin edge for EVERY year an Example is attested in.
+
+    The time axis was declared in the schema (TimeBin, example_has_timebin weight
+    1.00, time_overlap weight 0.40, all listed in AXIS_EDGE_TYPES["time"]) and the
+    graph never held a single edge of it — the one axis of the seven that was pure
+    declaration. The year was always there: ChEMBL documents carry a publication
+    year, folded into the Publication node's props at build time.
+
+    Two deliberate choices, both to keep the KG on the "facts" side of its own rule:
+
+      * An Example's time is not one number the KG gets to pick. The honest fact is
+        the SET of years the (compound, target) pairing is attested in, so we emit
+        one edge per (Example, year) with NO min/max aggregation. Downstream is free
+        to take the earliest (first-disclosure), the latest, or any-overlap; a fact
+        the KG collapsed here could not be recovered there. High-degree years are
+        handled the same way every other hub is — `degree` is recorded and the
+        audit's `cut` curve shows the partition cost.
+
+      * `time_overlap` is NOT built. Which year-distance counts as leakage is a
+        WINDOW, a downstream policy exactly like DEFAULT_WEIGHTS or the ligand
+        Tanimoto cut — not a fact about the data. The KG records which year each
+        Example sits in; the window is chosen where the leakage question is asked.
+
+    Only Examples whose provenance reaches a year-bearing Publication get a bin.
+    ChEMBL documents carry a year; BindingDB publications do not (they carry PMID/DOI,
+    not a date), so a purely-BindingDB example has no bin — and a computational decoy,
+    which has no measured provenance at all, has none either. The time axis is
+    therefore label-confounded on decoy benchmarks in exactly the way the assay and
+    publication axes are, and for the same reason; that is a true property of the
+    data, surfaced, not a gap in the build.
+    """
+    import json as _j
+
+    pub_year = (nodes.filter(pl.col("node_type") == NodeType.PUBLICATION.value)
+                .select(pl.col("node_id").alias("dst"),
+                        pl.col("props").str.json_path_match("$.year")
+                          .cast(pl.Int64, strict=False).alias("year"))
+                .filter(pl.col("year").is_not_null()))
+    if pub_year.is_empty():
+        log.warning("time axis: no Publication carries a year — axis left empty")
+        return nodes, edges
+
+    efp = (edges.filter(pl.col("edge_type") == EdgeType.EXAMPLE_FROM_PUBLICATION.value)
+           .select(pl.col("src").alias("example_id"), "dst"))
+    ex_year = (efp.join(pub_year, on="dst", how="inner")
+               .select("example_id", "year").unique())
+    if ex_year.is_empty():
+        log.warning("time axis: no Example reaches a year-bearing Publication — axis empty")
+        return nodes, edges
+
+    years = sorted(int(y) for y in ex_year["year"].unique().to_list())
+    tb_nodes = pl.DataFrame({
+        "node_id":   [f"timebin:{y}" for y in years],
+        "node_type": [NodeType.TIMEBIN.value] * len(years),
+        "label":     [str(y) for y in years],
+        "props":     [_j.dumps({"year": y}, sort_keys=True) for y in years],
+    })
+    ht_edges = (ex_year
+                .with_columns((pl.lit("timebin:") + pl.col("year").cast(pl.Utf8)).alias("dst"))
+                .select(pl.col("example_id").alias("src"), "dst",
+                        pl.lit(EdgeType.EXAMPLE_HAS_TIMEBIN.value).alias("edge_type"),
+                        pl.lit("{}").alias("props")))
+    n_ex = ht_edges["src"].n_unique()
+    log.info("time axis: %d TimeBin nodes (%d..%d), %d example_has_timebin edges "
+             "over %d Examples (%.1f%% of provenance-bearing examples get a bin)",
+             len(years), years[0], years[-1], ht_edges.height, n_ex,
+             100.0 * n_ex / max(1, efp["example_id"].n_unique()))
+    nodes = pl.concat([nodes, tb_nodes], how="vertical_relaxed")
+    edges = pl.concat([edges, ht_edges], how="vertical_relaxed")
+    return nodes, edges
 
 
 def _wire_reference_provenance(
@@ -995,6 +1083,13 @@ def consolidate(
     edges, n_ph = _fixes.drop_placeholder_publications(nodes, edges, chembl_db)
     log.info("dropped %d publication edges to placeholder DATASET docs", n_ph)
 
+    # Time axis (facts only). Built here: AFTER example_from_publication is final
+    # (placeholder DATASET docs already removed above, so no Example is time-binned
+    # through a non-publication) and BEFORE the orphan drop (so the new TimeBin nodes,
+    # which are reachable through the edges just added, are kept). time_overlap is
+    # deliberately not built — see _add_time_axis.
+    nodes, edges = _add_time_axis(nodes, edges, log)
+
     # Universal orphan drop: any node with degree 0 after the dangling-edge
     # prune is removed. This covers Protein/ProteinCluster (cluster member ids
     # that don't match KG protein ids), Assay/Publication (when reference-DB
@@ -1120,11 +1215,15 @@ def consolidate(
     stats.edges_by_type = dict(
         edges_df.group_by("edge_type").len().sort("len", descending=True).iter_rows()
     )
-    # Things we cannot compute on this box without an encoder.
+    # time_overlap is NOT a computation deferred for want of data — the years are in
+    # the graph. It is a downstream WINDOW policy (how many years apart counts as
+    # leakage), deliberately left to whoever asks the leakage question, exactly as
+    # DEFAULT_WEIGHTS is. example_has_timebin already carries the time facts.
+    # (example_from_assay / example_from_publication used to be listed here as
+    # deferred; they are now synthesised in _wire_reference_provenance, so the stale
+    # entries are gone.)
     stats.deferred = (stats.deferred or []) + [
-        "time_overlap_edges_need_ChEMBL_dates",
-        "example_from_assay_needs_chembl_assay_join",
-        "example_from_publication_needs_chembl_document_join",
+        "time_overlap_is_downstream_window_policy",
     ]
 
     _fixes.validate_canonical(nodes_df, edges_df)

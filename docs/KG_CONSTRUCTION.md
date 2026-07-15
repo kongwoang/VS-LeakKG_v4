@@ -77,21 +77,27 @@ Only needed if the graph changes; the shipped `outputs/kg/` is current.
 
 ```bash
 export PYTHONPATH=src
+export PYTHONNOUSERSITE=1                     # else ~/.local shadows the env's RDKit — §6
 PY=/vol/dl-nguyenb5-solar/users/hoangpc/envs/vsleak2/bin/python
 
-$PY -m vsleakkg.build_kg                     # raw KG, ~25 min on 32 cores
+$PY -m vsleakkg.build_kg                      # raw KG, ~25 min on 32 cores
 $PY -m vsleakkg.ligand_similarity \
       --kg-nodes data/processed/kg_nodes.parquet \
       --kg-edges data/processed/kg_edges.parquet \
-      --threshold 0.70 --workers 32          # ~30–45 min
-$PY tools/resolve_targets.py                 # 198 targets → UniProt (needs network)
-$PY tools/build_protein_axis.py              # sequences + MMseqs2 @ 30/50/90 %
-$PY -m vsleakkg.kg.consolidate --output-dir outputs/kg --corpus all   # ~5 min
+      --threshold 0.80 --workers 24           # ECFP4 bit-bound numpy kernel; ~4 h
+$PY tools/resolve_targets.py                  # 198 targets → UniProt (needs network)
+$PY tools/build_protein_axis.py               # sequences + MMseqs2 @ 30/50/90 %
+POLARS_MAX_THREADS=1 \
+  $PY -m vsleakkg.kg.consolidate --output-dir outputs/kg --corpus all   # ~20 min @ 1 thread
 $PY tools/audit_kg.py && $PY tools/audit_semantics.py
 ```
 
 The build is **deterministic**: two runs over the same input produce content-identical
 parquet. It also **refuses to write** a graph that fails validation — see §6.
+`ligand_similarity` persists its output to `data/processed/ligand_similar_edges.parquet`
+tagged with the ligand-set hash it was computed against, so a rebuild that does not
+change the ligand set can reattach the edges (`tools/reattach_ligand_similar.py`)
+instead of recomputing the ~4-hour pass.
 
 ---
 
@@ -175,11 +181,17 @@ with several proteins each, every one a bridge, and the protein axis collapsed i
 **one leakage group covering 100 % of examples** — a protein-clean split was
 arithmetically impossible and nothing said so.
 
-The BindingDB relation is kept, retyped **`ligand_measured_protein`** (Ligand →
+The measured relation is kept, retyped **`ligand_measured_protein`** (Ligand →
 Protein) and left **out of every leakage axis**. It is real evidence of *pretraining*
 contamination — a ChEMBL/BindingDB-trained model has seen that (ligand, protein) pair
 — which is a different question from benchmark-split leakage and should be asked
-separately, not smuggled into the protein axis.
+separately, not smuggled into the protein axis. It used to be **BindingDB-only**
+(378,427 pairs), because `chembl_activity_has_target` was never mapped to the canonical
+schema — so the corpus the models are actually pretrained on contributed nothing. ChEMBL
+is now wired in too: **2,942,019** edges in total (a pair measured in both sources is one
+edge, with both provenances in `props`). 587,511 further ChEMBL pairs are held back
+because their protein has no node yet — adding those proteins would re-cluster MMseqs
+and move the protein axis, so it is logged as an open decision, not taken silently.
 
 ### Scaffolds are keyed on chemistry, not on spelling
 
@@ -199,7 +211,7 @@ Four policies were removed from the build:
   bound memory". It silently truncated **71 %** of examples, and it truncated with a
   systematic bias: the kept assays were the five with the smallest ChEMBL id, i.e. the
   **oldest**. Two ligands sharing a recent assay were simply never linked. Uncapped,
-  `example_from_assay` goes from 10.3 M to **51.6 M** edges. Memory is cheap; a fact
+  `example_from_assay` goes from 10.3 M to **52.9 M** edges. Memory is cheap; a fact
   that was never recorded is not recoverable.
 - **`is_hub`.** A boolean set by `degree > 1000` — an arbitrary threshold frozen into
   the data. "How informative is sharing this node" is a **continuous** quantity (an
@@ -209,7 +221,10 @@ Four policies were removed from the build:
   excluding at all.
 - **The trivial-scaffold filter.** Scaffolds with ≤ 6 heavy atoms were deleted. But
   benzene **is** a scaffold; calling it weak evidence is an interpretation. Nodes are
-  kept, with `props.n_heavy_atoms` recorded.
+  kept, with `props.n_heavy_atoms` recorded — and recorded *correctly* even for the 37
+  aromatic-carbanion Murcko artefacts (`[c-]`) whose SMILES RDKit will not re-sanitise:
+  an unsanitised parse still yields a well-defined atom count, so the fact is recovered
+  rather than replaced by a `-1` sentinel.
 - **The decoy-protocol grouping.** "DUD-E and DEKOIS both use property-matched decoys,
   therefore they share a protocol" is an *inference*, not something the data states.
   It is now two tiers, so both facts are recorded separately and the downstream step
@@ -225,6 +240,27 @@ Four policies were removed from the build:
   decoy-generation procedure. LIT-PCBA and BigBind inactives are *experimentally
   measured*, not generated, so they get **no protocol edge at all**: linking them
   would fabricate a leakage path where none exists.
+
+### The time axis records years, not a leakage window
+
+The years were always in ChEMBL (a document carries a publication year); they had been
+dropped by a `.select()` that never listed the column, leaving every Publication with
+empty props and the time axis with zero edges. They are restored, and the axis is built
+as **facts only**:
+
+- `TimeBin` — one node per calendar year present, 1974–2024.
+- `example_has_timebin` — an example is linked to **every** year it is attested in, via
+  its provenance publications. No min/max: "the compound first appeared in 2011" is a
+  policy (earliest-disclosure); "the compound is attested in 2011, 2014 and 2019" is the
+  fact, and the downstream step picks how to reduce it.
+- `time_overlap` is **not built**. Which year-distance counts as leakage is a *window*,
+  the same kind of downstream choice as `DEFAULT_WEIGHTS` or the ligand Tanimoto cut —
+  not a statement the data makes. `audit_kg` flags it `DEFER`, not as a hole.
+
+Coverage is 16 %: only examples whose provenance reaches a year-bearing ChEMBL document
+get a bin. BindingDB publications carry PMID/DOI but no year, and a computational decoy
+has no measured provenance at all — so the axis is label-confounded on decoy benchmarks
+in exactly the way assay and publication are, and for the same reason.
 
 ### The one approximation that cannot be removed
 
@@ -250,8 +286,25 @@ grew write-time invariants in response. `consolidate` never did, so a corrupt gr
 could be written and audited later, or not at all.
 
 `fixes.validate_canonical()` now runs immediately before the parquet write and raises
-on NUL bytes, unknown node/edge types, duplicate ids or dangling edges. **A bad run
-dies instead of shipping a graph whose leakage numbers would be quietly wrong.**
+on NUL bytes, unknown node/edge types, duplicate ids or dangling edges; and
+`_enrich_example_props` raises if the corruption cost any example its `label_type` or
+`split` edge. **A bad run dies instead of shipping a graph whose leakage numbers would
+be quietly wrong.** The corruption scales with thread contention — under load,
+`POLARS_MAX_THREADS=8` lost 151,349 label-type edges, `=4` lost 8,780, and `=1` (fully
+serial) lost none. So the final `consolidate` runs at `POLARS_MAX_THREADS=1`, with a
+retry loop as backstop; each run either ships clean or dies, never ships damaged.
+
+### The RDKit version is locked to the graph
+
+Ligand and Scaffold node ids are `md5(RDKit canonical isomeric SMILES)`, so the graph's
+identity layer is a function of the RDKit build. The shipped graph was verified against
+its declared version empirically: re-canonicalising 5,000 stereo-bearing ligands under
+RDKit **2026.03.2** reproduces **5,000/5,000** stored node ids exactly, while RDKit
+2025.9.5 (an older build sitting in `~/.local`) reproduces only 4,918 — 82 E/Z ligands
+canonicalise differently. `environment.yml` pins 2026.03.2, the build_kg cache
+fingerprint includes `rdkit.__version__`, and the run environment must set
+`PYTHONNOUSERSITE=1` so the pinned RDKit is not shadowed by `~/.local` (see `CONTEXT.md`
+§4). Change the version deliberately, and rebuild the whole graph when you do.
 
 ### It is deterministic
 

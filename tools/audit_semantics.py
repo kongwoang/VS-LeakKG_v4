@@ -278,6 +278,13 @@ for cut in (None, 100000, 10000, 1000, 100):
     groups(asy, [], "assay", cut)
 for cut in (None, 10000, 1000, 100):
     groups(pub, [], "publication", cut)
+# Trục time: example nối tới MỌI năm attest. Một năm phổ biến (vd 2012) là hub gộp
+# nhiều example — y hệt assay/publication. `cut` bỏ năm bậc cao. KG không chọn cửa sổ
+# hộ; đây là đường cong để downstream nhìn thấy cái giá của mỗi lựa chọn cửa sổ W.
+tb = pairs("example_has_timebin").rename({"src": "ex", "dst": "mid"})
+if tb.height:
+    for cut in (None, 100000, 10000, 1000):
+        groups(tb, [], "time (year)", cut)
 
 # ---------------------------------------------------------------- D. label confound
 print("\nD. ĐỘ PHỦ CÓ TƯƠNG QUAN VỚI NHÃN KHÔNG? (bẫy khi chấm contamination)")

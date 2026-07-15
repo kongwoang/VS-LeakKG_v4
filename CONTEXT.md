@@ -10,8 +10,8 @@
 
 Source material: `docs/proposal.txt` (+ `VS_LeakKG.pdf`) — the paper proposal.
 
-Everything lives on VUW at `/vol/dl-nguyenb5-solar/users/hoangpc/VS-LeakKG_v4`.
-There is no Windows mirror and no git repo yet.
+Everything lives on VUW at `/vol/dl-nguyenb5-solar/users/hoangpc/VS-LeakKG_v4`,
+which is a git repository.
 
 ---
 
@@ -70,10 +70,14 @@ the experimental design is being rebuilt from scratch, and the graph had to be
 trustworthy first.
 
 ```
-outputs/kg/canonical_nodes.parquet    8,574,944 nodes
-outputs/kg/canonical_edges.parquet   75,369,818 edges
+outputs/kg/canonical_nodes.parquet    8,575,007 nodes
+outputs/kg/canonical_edges.parquet   92,040,201 edges
 outputs/kg/stats.csv
 ```
+Built under RDKit **2026.03.2** — the version determines the Ligand/Scaffold node ids
+(`md5(canonical isomeric SMILES)`), so it is pinned in `environment.yml` and locked into
+the build_kg cache. All seven axes are populated (`time_overlap` excepted — a deliberate
+downstream policy, not a fact).
 
 Two audit suites, both clean — **run them after any change to the KG**:
 
@@ -107,41 +111,55 @@ Measured, not assumed (`tools/audit_semantics.py`, section C):
 
 | axis | coverage | can it be partitioned? |
 |---|---:|---|
-| ligand | 100 % | yes — largest atomic block 0.1 % of the corpus |
+| ligand | 100 % | yes — largest atomic block 0.3 % at Tanimoto ≥ 0.80, 0.0 % at identity |
 | scaffold | 100 % | yes — 2.2 %, or 0.1 % if you exclude high-degree scaffolds |
 | protein (30/50/90 %) | 100 % | yes — 7.2 % at 90 %, 8.5 % at 30 % |
-| assay | 48 % | yes, but only with a degree cut-off: 44.8 % → 8.2 % |
-| publication | 48 % | yes — 13.0 %, but see the caveat below |
+| assay | 48 % | yes, but only with a degree cut-off: 45.0 % → 8.2 % |
+| publication | 48 % | yes — 13.1 %, but see the caveat below |
 | source / decoy | 100 % | trivially |
-| **time** | **0 %** | **the axis is empty** |
+| **time** | **16 %** | yes with a degree cut-off: 15.7 % → 0.0 %; window is downstream policy |
 
 Two things the experiment design must confront before writing a line of split code:
 
-**The provenance axes are confounded with the label.** In DUD-E, 91.8 % of actives
+**The provenance axes are confounded with the label.** In DUD-E, 92.0 % of actives
 have an assay edge and 0.9 % of decoys do; for publications it is 94.5 % vs 0.3 %.
 The reason is mundane — DUD-E actives come from ChEMBL, its decoys come from ZINC and
 were never assayed or published. This is simultaneously **a headline finding** (it is
 exactly the source-only shortcut of proposal §3.8: you can predict the label from
 provenance alone, without any protein–ligand modelling) **and a trap** (any
-contamination score on the assay or publication axis will be systematically higher
-for actives, so contamination-decile analyses will be confounded with the label).
+contamination score on the assay, publication *or time* axis will be systematically
+higher for actives, so contamination-decile analyses on them will be confounded with
+the label unless stratified). The time axis inherits this confound for the same
+reason — decoys have no dated provenance — so it is safe only on corpora with
+experimentally-measured negatives (LIT-PCBA), like assay and publication.
 
-**Three axes the proposal promises do not exist.** The **pocket** axis was removed in
-the v3 redesign — `data/raw/DUD-E_pockets_fetched/` is preserved if it is revived.
-The **time** axis is declared in the schema and carries zero edges; it needs ChEMBL
-document dates. And `example_from_assay` / `example_from_publication` are
-*ligand-mediated* — they mean "this example's ligand was tested in / reported in",
-not "this example's label came from". For most corpora no example-level assay id
-exists (a DUD-E decoy was never assayed), so this is the only available meaning, but
-it is weaker than the "Same assay identifier" of proposal Table 2 and must not be
-presented as that.
+**One axis the proposal promises still does not exist: the pocket axis**, removed in
+the v3 redesign — `data/raw/DUD-E_pockets_fetched/` is preserved if it is revived. The
+**time** axis, previously empty, is now built as facts: `example_has_timebin` links
+each example to every year it is attested in (16 % coverage — decoys and BindingDB-only
+examples have no year); `time_overlap` is deliberately left to downstream as a window
+policy. And `example_from_assay` / `example_from_publication` are *ligand-mediated* —
+they mean "this example's ligand was tested in / reported in", not "this example's
+label came from". For most corpora no example-level assay id exists (a DUD-E decoy was
+never assayed), so this is the only available meaning, but it is weaker than the "Same
+assay identifier" of proposal Table 2 and must not be presented as that.
 
 ---
 
 ## 4. Environment
 
 - Box: `cuda12.ecs.vuw.ac.nz`, 3 × Quadro RTX 6000, 93 GB RAM, 32 cores.
-- Python: `/vol/dl-nguyenb5-solar/users/hoangpc/envs/vsleak2/bin/python` (3.12,
-  polars + RDKit + scipy). MMseqs2 on `PATH` (`../bin`).
-- Run modules with `PYTHONPATH=src`.
+- Python: `/vol/dl-nguyenb5-solar/users/hoangpc/envs/vsleak2/bin/python` (3.12, a
+  micromamba env built from `environment.yml`; conda-forge RDKit **2026.03.2**, polars
+  1.40.1, scipy, numpy). MMseqs2 on `PATH` (`../bin`).
+- Run modules with `PYTHONPATH=src` **and `PYTHONNOUSERSITE=1`**. The latter is not
+  optional: `~/.local/lib/python3.12/site-packages` carries an older RDKit (2025.9.5)
+  and on this box user-site sits *ahead* of the env in `sys.path`, so without the flag
+  `import rdkit` silently resolves to 2025.9.5 — a different canonicaliser, hence
+  different node ids. The env's `activate.d` sets it, but direct `bin/python` calls
+  must export it. (`openbabel` is absent — it forces an older `icu` that conflicts with
+  the pinned RDKit, and nothing in the pipeline imports it.)
+- polars on this box intermittently corrupts strings under load; the build guards
+  against it and refuses to ship a corrupt graph (see `KG_CONSTRUCTION.md` §6). Run
+  `consolidate` with `POLARS_MAX_THREADS=1` for the cleanest result.
 - `outputs/kg_v0/` holds the inherited v3 graph, kept for comparison.

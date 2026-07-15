@@ -67,8 +67,20 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
-from rdkit import Chem, DataStructs
+from rdkit import Chem, DataStructs, RDLogger
 from rdkit.Chem import AllChem
+
+# GetMorganFingerprintAsBitVect is deprecated in current RDKit and emits a
+# "please use MorganGenerator" warning THROUGH THE C++ LOGGER (rdApp.warning),
+# once per molecule. This module fingerprints ~2 M ligands across `spawn`
+# workers, each of which re-imports this module fresh and does NOT inherit the
+# parent's logger state — so without this line every worker floods one shared
+# NFS log file with millions of identical warnings (measured: 23.5 MB / 227,799
+# lines in 8 minutes, before a single Tanimoto had been computed). chem.py
+# disables the same log at module level for exactly this reason; do the same
+# here. Under spawn the child re-runs this at import; under fork it inherits it;
+# _fp_pack_worker repeats it as belt-and-braces.
+RDLogger.DisableLog("rdApp.*")
 
 log = logging.getLogger("vsleakkg.ligand_similarity")
 
@@ -89,6 +101,7 @@ def _fp_pack_worker(args: tuple[int, list[str]]) -> tuple[int, list[bytes | None
     `DataStructs.CreateFromBinaryText`. Returning blobs (not BitVect objects)
     is cheaper to pickle across the multiprocessing boundary.
     """
+    RDLogger.DisableLog("rdApp.*")   # spawn worker: re-assert, do not rely on import order
     start, smis = args
     out: list[bytes | None] = []
     for s in smis:

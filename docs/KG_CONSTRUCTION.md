@@ -193,6 +193,20 @@ edge, with both provenances in `props`). 587,511 further ChEMBL pairs are held b
 because their protein has no node yet — adding those proteins would re-cluster MMseqs
 and move the protein axis, so it is logged as an open decision, not taken silently.
 
+The benchmark→reference join is verified to be exact, not fuzzy: recomputing the InChIKey
+of both endpoints of 3,000 sampled `benchmark_ligand_same_inchikey_as_chembl_ligand` edges
+reproduces the **full** InChIKey 3,000/3,000 — the ChEMBL provenance links the same
+molecule, never a first-block (connectivity-only) near-match. BindingDB is messier: its
+`Ligand SMILES` and `Ligand InChI Key` columns disagree for ~0.66 % of records (the two
+fields name different compounds — inherited BindingDB curation, not a loader bug). Since
+the InChIKey is the join key and the node id, it is authoritative, and
+`_guard_bindingdb_smiles` blanks any SMILES whose connectivity contradicts it so the graph
+never records a self-contradictory node. The wrong SMILES never reached the canonical KG
+anyway (BindingDBLigand nodes are dropped, and the benchmark Ligand keeps its own correct
+SMILES); the residual risk is that BindingDB may have mis-associated the publication/target
+for those ~0.66 % of records, which bounds any misattributed BindingDB-sourced provenance
+(26 % of `example_from_publication`, 18 % of `ligand_measured_protein`) at well under 0.2 %.
+
 ### Scaffolds are keyed on chemistry, not on spelling
 
 A Bemis-Murcko scaffold is a **topological** object: two stereoisomers share it, and a

@@ -312,6 +312,51 @@ def task_load_chembl() -> str:
 
 
 # -------- 2. load_bindingdb --------
+def _guard_bindingdb_smiles(lig_df: "pl.DataFrame") -> "pl.DataFrame":
+    """Blank BindingDB SMILES that name a different molecule than their own InChIKey.
+
+    BindingDB's `Ligand SMILES` and `Ligand InChI Key` columns disagree for a small
+    fraction of its records — the two fields describe different compounds (a known
+    BindingDB curation inconsistency, not a parsing artefact of this loader). Measured:
+    of 251,727 unique ligands, ~0.66 % have a SMILES whose connectivity block
+    contradicts the InChIKey, ~0.91 % differ only in stereo/isotope, ~1.24 % have a
+    SMILES RDKit cannot parse.
+
+    The InChIKey is authoritative here: it is the key benchmark ligands are joined on
+    (`task_bindingdb_map`) and it is the node id (`bdb_lig:<InChIKey>`). A SMILES that
+    its own InChIKey calls a different molecule is a false fact, so it is blanked. This
+    does not reach the canonical KG (BindingDBLigand nodes are dropped in consolidate,
+    and the benchmark Ligand keeps its own correct SMILES), and it does not touch the
+    provenance join (which uses the InChIKey) — but recording a self-contradictory node
+    is wrong regardless, and the count is logged so the inherited source quality is
+    visible instead of silent.
+    """
+    import multiprocessing as _mp
+    smis = lig_df["ligand_smiles"].to_list()
+    iks = lig_df["ligand_inchikey"].to_list()
+    with _mp.get_context("spawn").Pool(min(os.cpu_count() or 1, 16)) as pool:
+        recomp = pool.map(vc.inchikey, smis, chunksize=2000)
+    n_wrong = n_stereo = n_noparse = 0
+    cleaned: list = []
+    for smi, ik, rk in zip(smis, iks, recomp):
+        if not smi:
+            cleaned.append(smi); continue
+        if rk is None:
+            n_noparse += 1; cleaned.append(smi); continue
+        if rk == ik:
+            cleaned.append(smi)
+        elif rk[:14] == ik[:14]:
+            n_stereo += 1; cleaned.append(smi)          # same skeleton, stereo layer differs
+        else:
+            n_wrong += 1; cleaned.append(None)          # different molecule -> drop false SMILES
+    log.warning(
+        "BindingDB SMILES<->InChIKey guard: %d/%d ligands have a SMILES naming a "
+        "DIFFERENT molecule than their InChIKey (blanked); %d differ only in stereo "
+        "(kept); %d unparseable (kept). Inherited BindingDB source inconsistency — the "
+        "InChIKey (join key) is authoritative.", n_wrong, lig_df.height, n_stereo, n_noparse)
+    return lig_df.with_columns(pl.Series("ligand_smiles", cleaned))
+
+
 def task_load_bindingdb() -> str:
     if not BINDINGDB_TSV.exists():
         raise FileNotFoundError(BINDINGDB_TSV)
@@ -381,6 +426,7 @@ def task_load_bindingdb() -> str:
                 "zinc_id_ligand", "pubchem_cid"],
         orient="row",
     )
+    lig_df = _guard_bindingdb_smiles(lig_df)
     lig_df.write_parquet(lig_out)
     log.info("BindingDB: %d unique ligands written", lig_df.height)
     return f"records={rec_df.height:,}, unique_ligands={lig_df.height:,}"
